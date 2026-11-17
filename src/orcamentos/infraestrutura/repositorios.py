@@ -58,7 +58,7 @@ class OrcamentoRepositorioSql:
             existente.status = orcamento.status.value
             existente.motivo_decisao = orcamento.motivo_decisao
             existente.decidido_em = orcamento.decidido_em
-        self.db.commit()
+        self.db.flush()
         return orcamento
 
     def buscar_por_id(self, orcamento_id: UUID) -> Orcamento | None:
@@ -137,5 +137,5 @@ class OrcamentoRepositorioSql:
             motivo=motivo,
         )
         self.db.add(novo)
-        self.db.commit()
+        self.db.flush()
         return novo
