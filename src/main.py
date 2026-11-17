@@ -4,11 +4,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from src.config import Configuracoes
+from src.mensageria import outbox_inbox as _outbox_inbox  # noqa: F401
 from src.orcamentos.apresentacao.rotas import router as billing_router
 from src.orcamentos.infraestrutura import modelos as _modelos  # noqa: F401
 from src.shared.banco import Base
 from src.shared.observabilidade import configurar_observabilidade
 from src.shared.seguranca import ValidadorJwtRs256
+from src.worker import criar_provedor_pagamento
 
 
 def criar_app(configuracoes: Configuracoes | None = None) -> FastAPI:
@@ -46,6 +48,7 @@ def criar_app(configuracoes: Configuracoes | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.validador_jwt = ValidadorJwtRs256(config)
+    app.state.provedor_pagamento = criar_provedor_pagamento(config)
 
     @app.get("/health", tags=["health"])
     def health_check() -> dict[str, str]:

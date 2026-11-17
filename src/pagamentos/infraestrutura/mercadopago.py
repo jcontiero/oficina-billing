@@ -1,8 +1,10 @@
 import hashlib
 import hmac
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -315,11 +317,48 @@ class FakeMercadoPagoOrdersProvider:
     e geração de notificação webhook assinada (x-signature HMAC-SHA256).
     """
 
-    def __init__(self, webhook_secret: str = "test-mp-webhook-secret") -> None:
+    def __init__(
+        self,
+        webhook_secret: str = "test-mp-webhook-secret",
+        state_file: str | None = None,
+    ) -> None:
         self.webhook_secret = webhook_secret
+        self.state_file = Path(state_file) if state_file else None
         self._orders: dict[str, ResultadoOrdemProvedor] = {}
         self._idempotency_cache: dict[str, ResultadoOrdemProvedor] = {}
         self._seq = 0
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not self.state_file or not self.state_file.exists():
+            return
+        dados = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self._seq = int(dados.get("seq", 0))
+        self._orders = {
+            k: ResultadoOrdemProvedor(
+                provider_order_id=v["provider_order_id"],
+                external_reference=v["external_reference"],
+                status=StatusPagamentoProvedor(v["status"]),
+                total_centavos=int(v["total_centavos"]),
+                moeda=v["moeda"],
+                qr_data=v.get("qr_data"),
+                raw_status=v["raw_status"],
+            )
+            for k, v in dados.get("orders", {}).items()
+        }
+
+    def _save_state(self) -> None:
+        if not self.state_file:
+            return
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "seq": self._seq,
+            "orders": {
+                k: {**asdict(v), "status": v.status.value}
+                for k, v in self._orders.items()
+            },
+        }
+        self.state_file.write_text(json.dumps(payload), encoding="utf-8")
 
     def criar_cobranca(
         self,
@@ -350,9 +389,11 @@ class FakeMercadoPagoOrdersProvider:
         )
         self._orders[order_id] = ordem
         self._idempotency_cache[idempotency_key] = ordem
+        self._save_state()
         return ordem
 
     def consultar(self, provider_order_id: str) -> ResultadoOrdemProvedor:
+        self._load_state()
         if provider_order_id not in self._orders:
             raise ErroOperacaoProvedorError(f"Order {provider_order_id} não encontrada")
         return self._orders[provider_order_id]
@@ -377,6 +418,7 @@ class FakeMercadoPagoOrdersProvider:
             raw_status="processed",
         )
         self._orders[provider_order_id] = atualizada
+        self._save_state()
         assinatura = gerar_assinatura_webhook_mp(
             data_id=provider_order_id,
             x_request_id=x_request_id,
