@@ -147,3 +147,14 @@ output "billing_database_name" {
 output "billing_service_account_email" {
   value = google_service_account.billing_sa.email
 }
+
+data "google_project" "pubsub_project" {
+  project_id = var.project_id
+}
+
+resource "google_pubsub_subscription_iam_member" "dead_letter_forwarder" {
+  project      = var.project_id
+  subscription = google_pubsub_subscription.billing_comandos_sub.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:service-${data.google_project.pubsub_project.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
