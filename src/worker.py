@@ -165,6 +165,10 @@ def main() -> None:
     while True:
         try:
             with session_factory() as db:
+                BillingConsumidor(
+                    db, provedor, environment=env
+                ).reconciliar_operacoes_pendentes()
+            with session_factory() as db:
                 publicar_lote_outbox(db, publisher, project_id=project_id)
             consumir_comandos_pull(
                 session_factory,
