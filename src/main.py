@@ -1,3 +1,4 @@
+from src.pagamentos.infraestrutura import fake_persistente  # noqa: F401
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text

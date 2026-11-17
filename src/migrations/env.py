@@ -1,3 +1,4 @@
+from src.pagamentos.infraestrutura import fake_persistente  # noqa: F401
 from logging.config import fileConfig
 import os
 

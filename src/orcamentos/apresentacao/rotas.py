@@ -1,3 +1,4 @@
+from src.shared.observabilidade import traceparent_atual
 from datetime import datetime, timezone
 import json
 from typing import Any
@@ -245,7 +246,7 @@ def decidir_orcamento(
                 "aggregate_version": 2,
                 "payload": payload_evt,
             },
-            traceparent=request.headers.get("traceparent"),
+            traceparent=traceparent_atual(request.headers.get("traceparent")),
             status="PENDENTE",
         )
     )
@@ -344,7 +345,7 @@ def _processar_pagamento_webhook(
 ) -> None:
     provedor = request.app.state.provedor_pagamento
     env = request.app.state.config.environment
-    traceparent = request.headers.get("traceparent")
+    traceparent = traceparent_atual(request.headers.get("traceparent"))
     try:
         ordem = provedor.consultar(data_id)
         if ordem.status == StatusPagamentoProvedor.CONFIRMADO:
@@ -487,7 +488,12 @@ def buscar_pagamento_por_os(
 def simular_pagamento_fake_e2e(
     provider_order_id: str,
     request: Request,
+    principal: Principal = Depends(get_principal_atual),
 ) -> dict[str, Any]:
+    if principal.actor_type != ActorType.FUNCIONARIO or principal.perfil != "ADMIN":
+        raise HTTPException(
+            status_code=403, detail="Simulação financeira restrita a ADMIN"
+        )
     if request.app.state.config.mp_provider_mode != "fake":
         raise HTTPException(
             status_code=404, detail="Disponível apenas quando mp_provider_mode=fake"
@@ -501,7 +507,12 @@ def simular_pagamento_fake_e2e(
 def simular_recusa_fake_e2e(
     provider_order_id: str,
     request: Request,
+    principal: Principal = Depends(get_principal_atual),
 ) -> dict[str, Any]:
+    if principal.actor_type != ActorType.FUNCIONARIO or principal.perfil != "ADMIN":
+        raise HTTPException(
+            status_code=403, detail="Simulação financeira restrita a ADMIN"
+        )
     if request.app.state.config.mp_provider_mode != "fake":
         raise HTTPException(
             status_code=404, detail="Disponível apenas quando mp_provider_mode=fake"

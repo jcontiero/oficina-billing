@@ -26,3 +26,4 @@ class Configuracoes(BaseSettings):
     mp_base_url: str = "https://api.mercadopago.com"
     mp_provider_mode: str = "fake"
     mp_fake_state_file: str = ""
+    mp_fake_shared_database: bool = False

@@ -1,3 +1,4 @@
+from src.shared.observabilidade import consumir_contexto
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -29,6 +30,12 @@ def criar_provedor_pagamento(config: Configuracoes) -> ProvedorPagamento:
             external_pos_id=config.mp_external_pos_id,
             base_url=config.mp_base_url,
         )
+    if config.mp_fake_shared_database:
+        from src.pagamentos.infraestrutura.fake_persistente import (
+            ProvedorFakePersistente,
+        )
+
+        return ProvedorFakePersistente(config.database_url, config.mp_webhook_secret)
     return FakeMercadoPagoOrdersProvider(
         webhook_secret=config.mp_webhook_secret,
         state_file=config.mp_fake_state_file or None,
@@ -57,6 +64,7 @@ def publicar_lote_outbox(
         )
         .order_by(OutboxEventoModel.criado_em.asc())
         .limit(limit)
+        .with_for_update(skip_locked=True)
         .all()
     )
     if not eventos:
@@ -130,22 +138,26 @@ def consumir_comandos_pull(
         try:
             dados = json.loads(rec.message.data.decode("utf-8"))
             traceparent = (rec.message.attributes or {}).get("traceparent")
-            with session_factory() as db:
-                BillingConsumidor(
-                    db, provedor, environment=environment
-                ).processar_comando(dados, traceparent=traceparent)
+            with consumir_contexto(dados, traceparent) as traceparent:
+                with session_factory() as db:
+                    BillingConsumidor(
+                        db, provedor, environment=environment
+                    ).processar_comando(dados, traceparent=traceparent)
             subscriber.acknowledge(
                 request={"subscription": sub_path, "ack_ids": [ack_id]}
             )
             processadas += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Erro ao processar comando no Billing: %s", exc)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Erro ao processar comando no Billing (message_id=%s)",
+                getattr(rec.message, "message_id", "desconhecido"),
+            )
             try:
                 subscriber.modify_ack_deadline(
                     request={
                         "subscription": sub_path,
                         "ack_ids": [ack_id],
-                        "ack_deadline_seconds": 0,
+                        "ack_deadline_seconds": 10,
                     }
                 )
             except Exception:  # noqa: BLE001
