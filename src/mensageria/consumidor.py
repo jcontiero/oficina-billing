@@ -502,11 +502,14 @@ class BillingConsumidor:
                 reconciliadas += 1
 
             elif op.tipo == "REFUND" and pag.provider_order_id:
-                ordem = self.provedor.consultar(pag.provider_order_id)
-                if ordem.status != StatusPagamentoProvedor.ESTORNADO:
-                    ordem = self.provedor.estornar(
-                        pag.provider_order_id, idempotency_key=op.idempotency_key
-                    )
+                try:
+                    ordem = self.provedor.consultar(pag.provider_order_id)
+                    if ordem.status != StatusPagamentoProvedor.ESTORNADO:
+                        ordem = self.provedor.estornar(
+                            pag.provider_order_id, idempotency_key=op.idempotency_key
+                        )
+                except (ErroComunicacaoProvedorError, ErroOperacaoProvedorError):
+                    continue
                 if ordem.status == StatusPagamentoProvedor.ESTORNADO:
                     op.estado = "SUCESSO"
                     pag.status = "ESTORNADO"
