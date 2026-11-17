@@ -105,3 +105,21 @@ def test_simulacao_financeira_exige_admin(tmp_path, acao):
         id=uuid4(), actor_type=ActorType.FUNCIONARIO, perfil="ADMIN"
     )
     assert client.post(url).status_code == 200
+
+
+def test_notificacoes_de_ordens_distintas_nao_colidem(tmp_path):
+    from src.pagamentos.infraestrutura.mercadopago import FakeMercadoPagoOrdersProvider
+
+    provider = FakeMercadoPagoOrdersProvider()
+    requests = []
+    for i in range(2):
+        order = provider.criar_cobranca(
+            pagamento_id=str(i),
+            total_centavos=100,
+            moeda="BRL",
+            descricao="Teste",
+            idempotency_key=str(i),
+        )
+        headers, _ = provider.simular_pagamento_aprovado(order.provider_order_id)
+        requests.append(headers["x-request-id"])
+    assert len(set(requests)) == 2

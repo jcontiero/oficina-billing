@@ -455,9 +455,10 @@ class FakeMercadoPagoOrdersProvider:
         self,
         provider_order_id: str,
         *,
-        x_request_id: str = "req-webhook-001",
+        x_request_id: str | None = None,
         ts: str = "1763305200",
     ) -> tuple[dict[str, str], dict[str, Any]]:
+        x_request_id = x_request_id or f"fake-approved-{provider_order_id}"
         atual = self.consultar(provider_order_id)
         if atual.status == StatusPagamentoProvedor.CANCELADO:
             raise ErroOperacaoProvedorError("Não é possível aprovar order já cancelada")
@@ -494,9 +495,10 @@ class FakeMercadoPagoOrdersProvider:
         provider_order_id: str,
         *,
         motivo_raw: str = "failed",
-        x_request_id: str = "req-webhook-recusa-001",
+        x_request_id: str | None = None,
         ts: str = "1763305201",
     ) -> tuple[dict[str, str], dict[str, Any]]:
+        x_request_id = x_request_id or f"fake-refused-{provider_order_id}"
         atual = self.consultar(provider_order_id)
         if atual.status == StatusPagamentoProvedor.CONFIRMADO:
             raise ErroOperacaoProvedorError("Order já confirmada não pode ser recusada")
