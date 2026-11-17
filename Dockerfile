@@ -28,6 +28,7 @@ ENV PYTHONPATH=/app
 
 COPY src/ ./src/
 COPY docs/ ./docs/
+COPY alembic.ini .
 
 RUN chown -R appuser:appgroup /app
 USER appuser

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oficina-billing-config
+data:
+  ENVIRONMENT: "homolog"
+  GCP_PROJECT_ID: "fiap-project-514922"
+  JWT_AUDIENCE: "oficina-backend-homolog"
+  JWT_CLIENT_ISSUER: "oficina-auth-homolog"
+  JWT_ADMIN_ISSUER: "oficina-admin-homolog"
+  JWKS_URL: "https://GATEWAY_HOST_PLACEHOLDER/.well-known/jwks.json"
+  ADMIN_JWKS_URL: "http://oficina-api/.well-known/admin-jwks.json"
+  MP_PROVIDER_MODE: "fake"
+  DD_TRACE_ENABLED: "true"
+  DD_VERSION: "latest"
