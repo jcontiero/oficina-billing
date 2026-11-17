@@ -237,6 +237,98 @@ def test_orcamento_decisao_posse_e_pagamentos_api(app_client):
     assert r_pag_outro.status_code == 403
 
 
+def test_criar_orcamento_via_endpoint_e_bloqueio_por_tombstone_persistido(app_client):
+    app, client = app_client
+    token_admin = _emitir_jwt(
+        sub=uuid4(),
+        actor_type="FUNCIONARIO",
+        iss="oficina-admin-homolog",
+        perfil="ADMIN",
+    )
+    token_cliente = _emitir_jwt(
+        sub=uuid4(),
+        actor_type="CLIENTE",
+        iss="oficina-auth-homolog",
+    )
+    os_id = uuid4()
+    saga_id = uuid4()
+    cliente_id = uuid4()
+
+    payload = {
+        "os_id": str(os_id),
+        "saga_id": str(saga_id),
+        "cliente_id": str(cliente_id),
+        "rodada": 1,
+        "versao": 1,
+        "itens": [
+            {
+                "tipo": "SERVICO",
+                "referencia_id": str(uuid4()),
+                "descricao": "Revisão de freios",
+                "quantidade": 1,
+                "preco_unitario_centavos": 18000,
+            }
+        ],
+    }
+
+    # Cliente não pode gerar orçamento (403)
+    assert (
+        client.post(
+            "/v1/orcamentos",
+            json=payload,
+            headers={"Authorization": f"Bearer {token_cliente}"},
+        ).status_code
+        == 403
+    )
+
+    # Funcionário gera orçamento congelado em centavos (201)
+    r_created = client.post(
+        "/v1/orcamentos",
+        json=payload,
+        headers={"Authorization": f"Bearer {token_admin}"},
+    )
+    assert r_created.status_code == 201
+    assert r_created.json()["total_centavos"] == 18000
+
+    # Grava tombstone persistido da barreira para uma segunda saga cancelada
+    saga_cancelada = uuid4()
+    barreira_evt = uuid4()
+    with app.state.session_factory() as db:
+        repo = OrcamentoRepositorioSql(db)
+        repo.registrar_tombstone_barreira(
+            saga_id=saga_cancelada,
+            os_id=os_id,
+            rodada=2,
+            execucao_cancelada_event_id=barreira_evt,
+            motivo="FALHA_ENFILEIRAMENTO",
+        )
+        # Reenvio idempotente com mesmo event_id deve funcionar; divergente deve falhar
+        repo.registrar_tombstone_barreira(
+            saga_id=saga_cancelada,
+            os_id=os_id,
+            rodada=2,
+            execucao_cancelada_event_id=barreira_evt,
+            motivo="FALHA_ENFILEIRAMENTO",
+        )
+        db.commit()
+        with pytest.raises(ValueError, match="Conflito de barreira"):
+            repo.registrar_tombstone_barreira(
+                saga_id=saga_cancelada,
+                os_id=os_id,
+                rodada=2,
+                execucao_cancelada_event_id=uuid4(),
+                motivo="FALHA_ENFILEIRAMENTO",
+            )
+
+    # Tentativa tardia de gerar orçamento para saga com tombstone retorna 409
+    r_blocked = client.post(
+        "/v1/orcamentos",
+        json={**payload, "saga_id": str(saga_cancelada), "rodada": 2},
+        headers={"Authorization": f"Bearer {token_admin}"},
+    )
+    assert r_blocked.status_code == 409
+
+
 def test_webhook_mercadopago_assinatura_e_idempotencia(app_client):
     _, client = app_client
     assinatura = gerar_assinatura_webhook_mp(

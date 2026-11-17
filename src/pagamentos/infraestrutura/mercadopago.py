@@ -1,8 +1,10 @@
 import hashlib
 import hmac
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -51,6 +53,10 @@ class ProvedorPagamento(Protocol):
     ) -> ResultadoOrdemProvedor: ...
 
     def consultar(self, provider_order_id: str) -> ResultadoOrdemProvedor: ...
+
+    def buscar_por_external_reference(
+        self, external_reference: str
+    ) -> ResultadoOrdemProvedor | None: ...
 
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
@@ -261,7 +267,7 @@ class MercadoPagoOrdersClient:
             "description": descricao,
             "config": {
                 "qr": {
-                    "pos_id": self.external_pos_id,
+                    "external_pos_id": self.external_pos_id,
                     "mode": "dynamic",
                 }
             },
@@ -284,6 +290,20 @@ class MercadoPagoOrdersClient:
     def consultar(self, provider_order_id: str) -> ResultadoOrdemProvedor:
         data = self._request("GET", f"/v1/orders/{provider_order_id}")
         return self._parse_order(data)
+
+    def buscar_por_external_reference(
+        self, external_reference: str
+    ) -> ResultadoOrdemProvedor | None:
+        data = self._request(
+            "GET", f"/v1/orders?external_reference={external_reference}"
+        )
+        itens = data.get("elements") or data.get("results") or []
+        if not itens and "id" in data:
+            itens = [data]
+        for item in itens:
+            if str(item.get("external_reference", "")) == external_reference:
+                return self._parse_order(item)
+        return None
 
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
@@ -315,11 +335,70 @@ class FakeMercadoPagoOrdersProvider:
     e geração de notificação webhook assinada (x-signature HMAC-SHA256).
     """
 
-    def __init__(self, webhook_secret: str = "test-mp-webhook-secret") -> None:
+    def __init__(
+        self,
+        webhook_secret: str = "test-mp-webhook-secret",
+        state_file: str | None = None,
+    ) -> None:
         self.webhook_secret = webhook_secret
+        self.state_file = Path(state_file) if state_file else None
         self._orders: dict[str, ResultadoOrdemProvedor] = {}
         self._idempotency_cache: dict[str, ResultadoOrdemProvedor] = {}
         self._seq = 0
+        self._proxima_falha: Exception | None = None
+        self._falha_apos_efeito: bool = False
+        self._load_state()
+
+    def configurar_falha(
+        self, exc: Exception | None, *, apos_efeito: bool = False
+    ) -> None:
+        """Configura falha determinística na próxima chamada (ex: timeout após efeito)."""
+        self._proxima_falha = exc
+        self._falha_apos_efeito = apos_efeito
+
+    def _consumir_falha_pre(self) -> None:
+        if self._proxima_falha is not None and not self._falha_apos_efeito:
+            exc = self._proxima_falha
+            self._proxima_falha = None
+            raise exc
+
+    def _consumir_falha_pos(self) -> None:
+        if self._proxima_falha is not None and self._falha_apos_efeito:
+            exc = self._proxima_falha
+            self._proxima_falha = None
+            self._falha_apos_efeito = False
+            raise exc
+
+    def _load_state(self) -> None:
+        if not self.state_file or not self.state_file.exists():
+            return
+        dados = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self._seq = int(dados.get("seq", 0))
+        self._orders = {
+            k: ResultadoOrdemProvedor(
+                provider_order_id=v["provider_order_id"],
+                external_reference=v["external_reference"],
+                status=StatusPagamentoProvedor(v["status"]),
+                total_centavos=int(v["total_centavos"]),
+                moeda=v["moeda"],
+                qr_data=v.get("qr_data"),
+                raw_status=v["raw_status"],
+            )
+            for k, v in dados.get("orders", {}).items()
+        }
+
+    def _save_state(self) -> None:
+        if not self.state_file:
+            return
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "seq": self._seq,
+            "orders": {
+                k: {**asdict(v), "status": v.status.value}
+                for k, v in self._orders.items()
+            },
+        }
+        self.state_file.write_text(json.dumps(payload), encoding="utf-8")
 
     def criar_cobranca(
         self,
@@ -330,6 +409,7 @@ class FakeMercadoPagoOrdersProvider:
         descricao: str,
         idempotency_key: str,
     ) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         if idempotency_key in self._idempotency_cache:
             return self._idempotency_cache[idempotency_key]
 
@@ -350,20 +430,35 @@ class FakeMercadoPagoOrdersProvider:
         )
         self._orders[order_id] = ordem
         self._idempotency_cache[idempotency_key] = ordem
+        self._save_state()
+        self._consumir_falha_pos()
         return ordem
 
     def consultar(self, provider_order_id: str) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
+        self._load_state()
         if provider_order_id not in self._orders:
             raise ErroOperacaoProvedorError(f"Order {provider_order_id} não encontrada")
         return self._orders[provider_order_id]
+
+    def buscar_por_external_reference(
+        self, external_reference: str
+    ) -> ResultadoOrdemProvedor | None:
+        self._consumir_falha_pre()
+        self._load_state()
+        for ordem in self._orders.values():
+            if ordem.external_reference == external_reference:
+                return ordem
+        return None
 
     def simular_pagamento_aprovado(
         self,
         provider_order_id: str,
         *,
-        x_request_id: str = "req-webhook-001",
+        x_request_id: str | None = None,
         ts: str = "1763305200",
     ) -> tuple[dict[str, str], dict[str, Any]]:
+        x_request_id = x_request_id or f"fake-approved-{provider_order_id}"
         atual = self.consultar(provider_order_id)
         if atual.status == StatusPagamentoProvedor.CANCELADO:
             raise ErroOperacaoProvedorError("Não é possível aprovar order já cancelada")
@@ -377,6 +472,7 @@ class FakeMercadoPagoOrdersProvider:
             raw_status="processed",
         )
         self._orders[provider_order_id] = atualizada
+        self._save_state()
         assinatura = gerar_assinatura_webhook_mp(
             data_id=provider_order_id,
             x_request_id=x_request_id,
@@ -394,9 +490,51 @@ class FakeMercadoPagoOrdersProvider:
         }
         return headers, body
 
+    def simular_pagamento_recusado(
+        self,
+        provider_order_id: str,
+        *,
+        motivo_raw: str = "failed",
+        x_request_id: str | None = None,
+        ts: str = "1763305201",
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        x_request_id = x_request_id or f"fake-refused-{provider_order_id}"
+        atual = self.consultar(provider_order_id)
+        if atual.status == StatusPagamentoProvedor.CONFIRMADO:
+            raise ErroOperacaoProvedorError("Order já confirmada não pode ser recusada")
+        status_mapped = mapear_status_order_mp(motivo_raw)
+        atualizada = ResultadoOrdemProvedor(
+            provider_order_id=atual.provider_order_id,
+            external_reference=atual.external_reference,
+            status=status_mapped,
+            total_centavos=atual.total_centavos,
+            moeda=atual.moeda,
+            qr_data=atual.qr_data,
+            raw_status=motivo_raw,
+        )
+        self._orders[provider_order_id] = atualizada
+        self._save_state()
+        assinatura = gerar_assinatura_webhook_mp(
+            data_id=provider_order_id,
+            x_request_id=x_request_id,
+            ts=ts,
+            webhook_secret=self.webhook_secret,
+        )
+        headers = {
+            "x-signature": assinatura,
+            "x-request-id": x_request_id,
+        }
+        body = {
+            "action": f"order.{motivo_raw}",
+            "type": "order",
+            "data": {"id": provider_order_id},
+        }
+        return headers, body
+
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
     ) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         if idempotency_key in self._idempotency_cache:
             return self._idempotency_cache[idempotency_key]
 
@@ -416,11 +554,14 @@ class FakeMercadoPagoOrdersProvider:
         )
         self._orders[provider_order_id] = cancelada
         self._idempotency_cache[idempotency_key] = cancelada
+        self._save_state()
+        self._consumir_falha_pos()
         return cancelada
 
     def estornar(
         self, provider_order_id: str, *, idempotency_key: str
     ) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         if idempotency_key in self._idempotency_cache:
             return self._idempotency_cache[idempotency_key]
 
@@ -440,4 +581,6 @@ class FakeMercadoPagoOrdersProvider:
         )
         self._orders[provider_order_id] = estornada
         self._idempotency_cache[idempotency_key] = estornada
+        self._save_state()
+        self._consumir_falha_pos()
         return estornada

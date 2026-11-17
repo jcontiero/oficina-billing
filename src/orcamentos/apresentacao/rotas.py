@@ -1,14 +1,27 @@
+from src.shared.observabilidade import traceparent_atual
+from datetime import datetime, timezone
 import json
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from src.orcamentos.infraestrutura.modelos import WebhookInboxModel
+from src.mensageria.consumidor import confirmar_pagamento_aprovado
+from src.mensageria.outbox_inbox import OutboxEventoModel
+from src.orcamentos.dominio.entidades import (
+    ItemOrcamento,
+    TipoItemOrcamento,
+    criar_orcamento_congelado,
+)
+from src.orcamentos.infraestrutura.modelos import PagamentoModel, WebhookInboxModel
 from src.orcamentos.infraestrutura.repositorios import OrcamentoRepositorioSql
-from src.pagamentos.infraestrutura.mercadopago import validar_assinatura_webhook_mp
+from src.pagamentos.infraestrutura.mercadopago import (
+    ErroComunicacaoProvedorError,
+    StatusPagamentoProvedor,
+    validar_assinatura_webhook_mp,
+)
 from src.shared.seguranca import ActorType, Principal, get_principal_atual
 
 router = APIRouter()
@@ -20,6 +33,23 @@ class DecisaoOrcamentoRequest(BaseModel):
     motivo: str | None = None
 
 
+class ItemOrcamentoRequest(BaseModel):
+    tipo: TipoItemOrcamento
+    referencia_id: UUID
+    descricao: str = Field(min_length=1)
+    quantidade: int = Field(ge=1)
+    preco_unitario_centavos: int = Field(ge=0)
+
+
+class CriarOrcamentoRequest(BaseModel):
+    os_id: UUID
+    saga_id: UUID
+    cliente_id: UUID
+    rodada: int = Field(default=1, ge=1)
+    versao: int = Field(default=1, ge=1)
+    itens: list[ItemOrcamentoRequest] = Field(min_length=1)
+
+
 def get_db(request: Request):
     session_factory = request.app.state.session_factory
     db = session_factory()
@@ -27,6 +57,64 @@ def get_db(request: Request):
         yield db
     finally:
         db.close()
+
+
+@router.post(
+    "/v1/orcamentos",
+    status_code=status.HTTP_201_CREATED,
+    tags=["Orçamentos"],
+)
+def criar_orcamento_endpoint(
+    body: CriarOrcamentoRequest,
+    principal: Principal = Depends(get_principal_atual),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if principal.actor_type != ActorType.FUNCIONARIO or principal.perfil not in {
+        "ADMIN",
+        "MECANICO",
+    }:
+        raise HTTPException(
+            status_code=403, detail="Apenas funcionários podem gerar orçamento"
+        )
+
+    repo = OrcamentoRepositorioSql(db)
+    if repo.buscar_tombstone_por_saga(body.saga_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Saga cancelada por tombstone; não é permitido gerar orçamento tardio",
+        )
+
+    orcamento = criar_orcamento_congelado(
+        os_id=body.os_id,
+        saga_id=body.saga_id,
+        cliente_id=body.cliente_id,
+        rodada=body.rodada,
+        versao=body.versao,
+        itens=[
+            ItemOrcamento(
+                id=uuid4(),
+                tipo=i.tipo,
+                referencia_id=i.referencia_id,
+                descricao=i.descricao,
+                quantidade=i.quantidade,
+                preco_unitario_centavos=i.preco_unitario_centavos,
+            )
+            for i in body.itens
+        ],
+    )
+    repo.salvar(orcamento)
+    db.commit()
+    return {
+        "id": str(orcamento.id),
+        "os_id": str(orcamento.os_id),
+        "saga_id": str(orcamento.saga_id),
+        "cliente_id": str(orcamento.cliente_id),
+        "rodada": orcamento.rodada,
+        "versao": orcamento.versao,
+        "status": orcamento.status.value,
+        "total_centavos": orcamento.total_centavos,
+        "moeda": orcamento.moeda,
+    }
 
 
 @router.get("/v1/orcamentos/{orcamento_id}", tags=["Orçamentos"])
@@ -82,6 +170,7 @@ def consultar_orcamento(
 def decidir_orcamento(
     orcamento_id: UUID,
     body: DecisaoOrcamentoRequest,
+    request: Request,
     principal: Principal = Depends(get_principal_atual),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -106,7 +195,63 @@ def decidir_orcamento(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    env = request.app.state.config.environment
+    evt_id = uuid4()
+    if body.aprovado:
+        event_type = "OrcamentoAprovado.v1"
+        payload_evt = {
+            "rodada": orcamento.rodada,
+            "orcamento_id": str(orcamento.id),
+            "versao": orcamento.versao,
+            "cliente_id": str(orcamento.cliente_id),
+            "total_centavos": orcamento.total_centavos,
+            "moeda": orcamento.moeda,
+            "itens_peca": [
+                {
+                    "peca_id": str(i.referencia_id),
+                    "descricao": i.descricao,
+                    "quantidade": i.quantidade,
+                    "preco_unitario_centavos": i.preco_unitario_centavos,
+                }
+                for i in orcamento.itens
+                if i.tipo == TipoItemOrcamento.PECA
+            ],
+        }
+    else:
+        event_type = "OrcamentoRecusado.v1"
+        payload_evt = {
+            "rodada": orcamento.rodada,
+            "orcamento_id": str(orcamento.id),
+            "versao": orcamento.versao,
+            "cliente_id": str(orcamento.cliente_id),
+            "motivo": body.motivo or "RECUSADO_PELO_CLIENTE",
+        }
+
+    db.add(
+        OutboxEventoModel(
+            id=str(evt_id),
+            event_id=str(evt_id),
+            topic=f"oficina-{env}-eventos-v1",
+            tipo_evento=event_type,
+            payload={
+                "event_id": str(evt_id),
+                "event_type": event_type,
+                "schema_version": 1,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "producer": "oficina-billing",
+                "saga_id": str(orcamento.saga_id),
+                "os_id": str(orcamento.os_id),
+                "correlation_id": str(orcamento.saga_id),
+                "causation_id": str(evt_id),
+                "aggregate_version": 2,
+                "payload": payload_evt,
+            },
+            traceparent=traceparent_atual(request.headers.get("traceparent")),
+            status="PENDENTE",
+        )
+    )
     repo.salvar(orcamento)
+    db.commit()
     return {
         "orcamento_id": str(orcamento.id),
         "os_id": str(orcamento.os_id),
@@ -150,6 +295,86 @@ def consultar_pagamento(
     }
 
 
+def _emitir_pagamento_recusado_webhook(
+    db: Session,
+    *,
+    pag: PagamentoModel,
+    data_id: str,
+    motivo: str,
+    environment: str,
+    traceparent: str | None,
+) -> None:
+    evt_id = uuid4()
+    db.add(
+        OutboxEventoModel(
+            id=str(evt_id),
+            event_id=str(evt_id),
+            topic=f"oficina-{environment}-eventos-v1",
+            tipo_evento="PagamentoRecusado.v1",
+            payload={
+                "event_id": str(evt_id),
+                "event_type": "PagamentoRecusado.v1",
+                "schema_version": 1,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "producer": "oficina-billing",
+                "saga_id": pag.saga_id,
+                "os_id": pag.os_id,
+                "correlation_id": pag.saga_id,
+                "causation_id": str(evt_id),
+                "aggregate_version": 4,
+                "payload": {
+                    "rodada": pag.rodada,
+                    "orcamento_id": pag.orcamento_id,
+                    "pagamento_id": pag.id,
+                    "provider_order_id": data_id,
+                    "motivo": motivo,
+                },
+            },
+            traceparent=traceparent,
+            status="PENDENTE",
+        )
+    )
+
+
+def _processar_pagamento_webhook(
+    db: Session,
+    *,
+    request: Request,
+    pag: PagamentoModel,
+    data_id: str,
+) -> None:
+    provedor = request.app.state.provedor_pagamento
+    env = request.app.state.config.environment
+    traceparent = traceparent_atual(request.headers.get("traceparent"))
+    try:
+        ordem = provedor.consultar(data_id)
+        if ordem.status == StatusPagamentoProvedor.CONFIRMADO:
+            confirmar_pagamento_aprovado(
+                db,
+                pag,
+                ordem,
+                environment=env,
+                traceparent=traceparent,
+            )
+        elif ordem.status in {
+            StatusPagamentoProvedor.RECUSADO,
+            StatusPagamentoProvedor.CANCELADO,
+        }:
+            pag.status = ordem.status.value
+            _emitir_pagamento_recusado_webhook(
+                db,
+                pag=pag,
+                data_id=data_id,
+                motivo=ordem.raw_status,
+                environment=env,
+                traceparent=traceparent,
+            )
+    except ErroComunicacaoProvedorError:
+        pag.status = "PENDENTE_RECONCILIACAO"
+    except Exception:
+        pass
+
+
 @router.post("/webhooks/mercadopago", tags=["Pagamentos"])
 def receber_webhook_mercadopago(
     request: Request,
@@ -176,13 +401,146 @@ def receber_webhook_mercadopago(
         .first()
     )
     if existente is None:
-        registro = WebhookInboxModel(
-            request_id=x_request_id,
-            data_id=data_id,
-            action=action,
-            payload_json=json.dumps(payload),
+        db.add(
+            WebhookInboxModel(
+                request_id=x_request_id,
+                data_id=data_id,
+                action=action,
+                payload_json=json.dumps(payload),
+            )
         )
-        db.add(registro)
+        pag = (
+            db.query(PagamentoModel)
+            .filter(PagamentoModel.provider_order_id == data_id)
+            .first()
+        )
+        if pag is not None and pag.status != StatusPagamentoProvedor.CONFIRMADO.value:
+            _processar_pagamento_webhook(db, request=request, pag=pag, data_id=data_id)
         db.commit()
 
     return {"status": "received", "data_id": data_id}
+
+
+@router.get("/v1/orcamentos/por-os/{os_id}", tags=["Orçamentos"])
+def buscar_orcamento_por_os(
+    os_id: UUID,
+    principal: Principal = Depends(get_principal_atual),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    from src.orcamentos.infraestrutura.modelos import OrcamentoModel
+
+    orc = (
+        db.query(OrcamentoModel)
+        .filter(OrcamentoModel.os_id == str(os_id))
+        .order_by(OrcamentoModel.rodada.desc(), OrcamentoModel.versao.desc())
+        .first()
+    )
+    if orc is None:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado para OS")
+    if (
+        principal.actor_type == ActorType.CLIENTE
+        and str(principal.id) != orc.cliente_id
+    ):
+        raise HTTPException(status_code=403, detail="Acesso negado")
+    return {
+        "id": orc.id,
+        "os_id": orc.os_id,
+        "saga_id": orc.saga_id,
+        "rodada": orc.rodada,
+        "versao": orc.versao,
+        "status": orc.status,
+        "total_centavos": orc.total_centavos,
+    }
+
+
+@router.get("/v1/pagamentos/por-os/{os_id}", tags=["Pagamentos"])
+def buscar_pagamento_por_os(
+    os_id: UUID,
+    principal: Principal = Depends(get_principal_atual),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    pag = (
+        db.query(PagamentoModel)
+        .filter(PagamentoModel.os_id == str(os_id))
+        .order_by(PagamentoModel.rodada.desc())
+        .first()
+    )
+    if pag is None:
+        raise HTTPException(status_code=404, detail="Pagamento não encontrado para OS")
+    if (
+        principal.actor_type == ActorType.CLIENTE
+        and str(principal.id) != pag.cliente_id
+    ):
+        raise HTTPException(status_code=403, detail="Acesso negado")
+    return {
+        "id": pag.id,
+        "orcamento_id": pag.orcamento_id,
+        "os_id": pag.os_id,
+        "saga_id": pag.saga_id,
+        "provider_order_id": pag.provider_order_id,
+        "qr_data": pag.qr_data,
+        "status": pag.status,
+        "total_centavos": pag.total_centavos,
+    }
+
+
+@router.post("/internal/fake-mp/{provider_order_id}/pagar", tags=["Pagamentos"])
+def simular_pagamento_fake_e2e(
+    provider_order_id: str,
+    request: Request,
+    principal: Principal = Depends(get_principal_atual),
+) -> dict[str, Any]:
+    if principal.actor_type != ActorType.FUNCIONARIO or principal.perfil != "ADMIN":
+        raise HTTPException(
+            status_code=403, detail="Simulação financeira restrita a ADMIN"
+        )
+    if request.app.state.config.mp_provider_mode != "fake":
+        raise HTTPException(
+            status_code=404, detail="Disponível apenas quando mp_provider_mode=fake"
+        )
+    provedor = request.app.state.provedor_pagamento
+    headers, body = provedor.simular_pagamento_aprovado(provider_order_id)
+    return {"headers": headers, "body": body}
+
+
+@router.post("/internal/fake-mp/{provider_order_id}/recusar", tags=["Pagamentos"])
+def simular_recusa_fake_e2e(
+    provider_order_id: str,
+    request: Request,
+    principal: Principal = Depends(get_principal_atual),
+) -> dict[str, Any]:
+    if principal.actor_type != ActorType.FUNCIONARIO or principal.perfil != "ADMIN":
+        raise HTTPException(
+            status_code=403, detail="Simulação financeira restrita a ADMIN"
+        )
+    if request.app.state.config.mp_provider_mode != "fake":
+        raise HTTPException(
+            status_code=404, detail="Disponível apenas quando mp_provider_mode=fake"
+        )
+    provedor = request.app.state.provedor_pagamento
+    headers, body = provedor.simular_pagamento_recusado(provider_order_id)
+    return {"headers": headers, "body": body}
+
+
+@router.post("/v1/pagamentos/reconciliar", tags=["Pagamentos"])
+def reconciliar_pagamentos_pendentes(
+    request: Request,
+    principal: Principal = Depends(get_principal_atual),
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    if (
+        principal.actor_type != ActorType.FUNCIONARIO
+        or (principal.perfil or "").upper() != "ADMIN"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Apenas perfil ADMIN pode acionar reconciliação financeira",
+        )
+    from src.mensageria.consumidor import BillingConsumidor
+
+    consumidor = BillingConsumidor(
+        db,
+        request.app.state.provedor_pagamento,
+        environment=request.app.state.config.environment,
+    )
+    return {"reconciliadas": consumidor.reconciliar_operacoes_pendentes()}

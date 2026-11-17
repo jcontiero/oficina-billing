@@ -22,6 +22,7 @@ spec:
         app: oficina-billing
         tags.datadoghq.com/service: oficina-billing
     spec:
+      serviceAccountName: oficina-billing-sa
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -30,30 +31,39 @@ spec:
       containers:
         - name: api
           image: us-east1-docker.pkg.dev/fiap-project-514922/oficina-docker/oficina-billing:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
+          command:
+            - sh
+            - -c
+            - |
+              export DATABASE_URL=$(cat /mnt/secrets-store/DATABASE_URL)
+              export MP_ACCESS_TOKEN=$(cat /mnt/secrets-store/MP_ACCESS_TOKEN)
+              export MP_WEBHOOK_SECRET=$(cat /mnt/secrets-store/MP_WEBHOOK_SECRET)
+              exec uvicorn src.main:app --host 0.0.0.0 --port 8000
           ports:
             - name: http
               containerPort: 8000
           envFrom:
             - configMapRef:
                 name: oficina-billing-config
-            - secretRef:
-                name: oficina-billing-secret
           env:
             - name: DD_ENV
               valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+                configMapKeyRef:
+                  name: oficina-billing-config
+                  key: ENVIRONMENT
             - name: DD_SERVICE
               value: "oficina-billing"
-            - name: DD_VERSION
-              value: "latest"
             - name: DD_AGENT_HOST
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
             - name: DD_TRACE_AGENT_PORT
               value: "8126"
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -80,3 +90,10 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 2
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: oficina-billing-secrets

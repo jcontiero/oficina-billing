@@ -12,6 +12,7 @@ from src.orcamentos.infraestrutura.modelos import (
     OrcamentoItemModel,
     OrcamentoModel,
     PagamentoModel,
+    SagaTombstoneBillingModel,
 )
 
 
@@ -57,7 +58,7 @@ class OrcamentoRepositorioSql:
             existente.status = orcamento.status.value
             existente.motivo_decisao = orcamento.motivo_decisao
             existente.decidido_em = orcamento.decidido_em
-        self.db.commit()
+        self.db.flush()
         return orcamento
 
     def buscar_por_id(self, orcamento_id: UUID) -> Orcamento | None:
@@ -99,3 +100,42 @@ class OrcamentoRepositorioSql:
             .filter(PagamentoModel.id == str(pagamento_id))
             .first()
         )
+
+    def buscar_tombstone_por_saga(
+        self, saga_id: UUID
+    ) -> SagaTombstoneBillingModel | None:
+        return (
+            self.db.query(SagaTombstoneBillingModel)
+            .filter(SagaTombstoneBillingModel.saga_id == str(saga_id))
+            .first()
+        )
+
+    def registrar_tombstone_barreira(
+        self,
+        *,
+        saga_id: UUID,
+        os_id: UUID,
+        rodada: int,
+        execucao_cancelada_event_id: UUID,
+        motivo: str,
+    ) -> SagaTombstoneBillingModel:
+        existente = self.buscar_tombstone_por_saga(saga_id)
+        if existente is not None:
+            if existente.execucao_cancelada_event_id != str(
+                execucao_cancelada_event_id
+            ):
+                raise ValueError(
+                    "Conflito de barreira: execucao_cancelada_event_id diverge do tombstone persistido"
+                )
+            return existente
+
+        novo = SagaTombstoneBillingModel(
+            saga_id=str(saga_id),
+            os_id=str(os_id),
+            rodada=rodada,
+            execucao_cancelada_event_id=str(execucao_cancelada_event_id),
+            motivo=motivo,
+        )
+        self.db.add(novo)
+        self.db.flush()
+        return novo
