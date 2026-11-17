@@ -1,11 +1,16 @@
 import json
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from src.orcamentos.dominio.entidades import (
+    ItemOrcamento,
+    TipoItemOrcamento,
+    criar_orcamento_congelado,
+)
 from src.orcamentos.infraestrutura.modelos import WebhookInboxModel
 from src.orcamentos.infraestrutura.repositorios import OrcamentoRepositorioSql
 from src.pagamentos.infraestrutura.mercadopago import validar_assinatura_webhook_mp
@@ -20,6 +25,23 @@ class DecisaoOrcamentoRequest(BaseModel):
     motivo: str | None = None
 
 
+class ItemOrcamentoRequest(BaseModel):
+    tipo: TipoItemOrcamento
+    referencia_id: UUID
+    descricao: str = Field(min_length=1)
+    quantidade: int = Field(ge=1)
+    preco_unitario_centavos: int = Field(ge=0)
+
+
+class CriarOrcamentoRequest(BaseModel):
+    os_id: UUID
+    saga_id: UUID
+    cliente_id: UUID
+    rodada: int = Field(default=1, ge=1)
+    versao: int = Field(default=1, ge=1)
+    itens: list[ItemOrcamentoRequest] = Field(min_length=1)
+
+
 def get_db(request: Request):
     session_factory = request.app.state.session_factory
     db = session_factory()
@@ -27,6 +49,63 @@ def get_db(request: Request):
         yield db
     finally:
         db.close()
+
+
+@router.post(
+    "/v1/orcamentos",
+    status_code=status.HTTP_201_CREATED,
+    tags=["Orçamentos"],
+)
+def criar_orcamento_endpoint(
+    body: CriarOrcamentoRequest,
+    principal: Principal = Depends(get_principal_atual),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if principal.actor_type != ActorType.FUNCIONARIO or principal.perfil not in {
+        "ADMIN",
+        "MECANICO",
+    }:
+        raise HTTPException(
+            status_code=403, detail="Apenas funcionários podem gerar orçamento"
+        )
+
+    repo = OrcamentoRepositorioSql(db)
+    if repo.buscar_tombstone_por_saga(body.saga_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Saga cancelada por tombstone; não é permitido gerar orçamento tardio",
+        )
+
+    orcamento = criar_orcamento_congelado(
+        os_id=body.os_id,
+        saga_id=body.saga_id,
+        cliente_id=body.cliente_id,
+        rodada=body.rodada,
+        versao=body.versao,
+        itens=[
+            ItemOrcamento(
+                id=uuid4(),
+                tipo=i.tipo,
+                referencia_id=i.referencia_id,
+                descricao=i.descricao,
+                quantidade=i.quantidade,
+                preco_unitario_centavos=i.preco_unitario_centavos,
+            )
+            for i in body.itens
+        ],
+    )
+    repo.salvar(orcamento)
+    return {
+        "id": str(orcamento.id),
+        "os_id": str(orcamento.os_id),
+        "saga_id": str(orcamento.saga_id),
+        "cliente_id": str(orcamento.cliente_id),
+        "rodada": orcamento.rodada,
+        "versao": orcamento.versao,
+        "status": orcamento.status.value,
+        "total_centavos": orcamento.total_centavos,
+        "moeda": orcamento.moeda,
+    }
 
 
 @router.get("/v1/orcamentos/{orcamento_id}", tags=["Orçamentos"])

@@ -132,3 +132,23 @@ class WebhookInboxModel(Base):
         nullable=False,
         default=lambda: datetime.now(UTC),
     )
+
+
+class SagaTombstoneBillingModel(Base):
+    """
+    Controle terminal por saga_id no Billing para bloquear GerarOrcamento.v1 ou
+    CriarCobranca.v1 tardios após cancelamento e registrar a barreira confirmada.
+    """
+
+    __tablename__ = "saga_tombstones"
+
+    saga_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    os_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    rodada: Mapped[int] = mapped_column(Integer, nullable=False)
+    execucao_cancelada_event_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    motivo: Mapped[str] = mapped_column(String(64), nullable=False)
+    criado_em: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
