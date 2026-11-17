@@ -187,8 +187,10 @@ def test_reconciliacao_timeout_criar_cobranca_sem_duplicar(tmp_path: Path) -> No
         assert res == "PENDENTE_RECONCILIACAO"
         op = db.query(ProviderOperationModel).first()
         pag = db.query(PagamentoModel).first()
-        assert op is not None and op.estado == "DESCONHECIDO"
-        assert pag is not None and pag.status == "PENDENTE_RECONCILIACAO"
+        assert op is not None
+        assert op.estado == "DESCONHECIDO"
+        assert pag is not None
+        assert pag.status == "PENDENTE_RECONCILIACAO"
         assert db.query(OutboxEventoModel).count() == 0
 
     with session_factory() as db:
@@ -199,9 +201,12 @@ def test_reconciliacao_timeout_criar_cobranca_sem_duplicar(tmp_path: Path) -> No
         op = db.query(ProviderOperationModel).first()
         pag = db.query(PagamentoModel).first()
         out = db.query(OutboxEventoModel).first()
-        assert op is not None and op.estado == "SUCESSO"
-        assert pag is not None and pag.provider_order_id == "ORD_TEST_000001"
-        assert out is not None and out.tipo_evento == "CobrancaCriada.v1"
+        assert op is not None
+        assert op.estado == "SUCESSO"
+        assert pag is not None
+        assert pag.provider_order_id == "ORD_TEST_000001"
+        assert out is not None
+        assert out.tipo_evento == "CobrancaCriada.v1"
         # Não houve segunda criação de ordem no provedor
         assert provedor._seq == 1
 
@@ -262,13 +267,15 @@ def test_webhook_assinatura_recusa_e_falha_estorno_recuperavel(tmp_path: Path) -
 
     with session_factory() as db:
         pag = db.query(PagamentoModel).filter(PagamentoModel.id == pag_id).first()
-        assert pag is not None and pag.status == "PENDENTE_RECONCILIACAO"
+        assert pag is not None
+        assert pag.status == "PENDENTE_RECONCILIACAO"
         reconciliadas = BillingConsumidor(
             db, provedor
         ).reconciliar_operacoes_pendentes()
         assert reconciliadas == 1
         pag = db.query(PagamentoModel).filter(PagamentoModel.id == pag_id).first()
-        assert pag is not None and pag.status == "CONFIRMADO"
+        assert pag is not None
+        assert pag.status == "CONFIRMADO"
 
     # 3. Falha no estorno -> FALHA_ESTORNO + EstornoFalhou.v1, depois recupera via reconciliação
     provedor.configurar_falha(ErroOperacaoProvedorError("timeout MP refund"))
@@ -290,7 +297,8 @@ def test_webhook_assinatura_recusa_e_falha_estorno_recuperavel(tmp_path: Path) -
             )
         )
         pag = db.query(PagamentoModel).filter(PagamentoModel.id == pag_id).first()
-        assert pag is not None and pag.status == "FALHA_ESTORNO"
+        assert pag is not None
+        assert pag.status == "FALHA_ESTORNO"
         evts = [e.tipo_evento for e in db.query(OutboxEventoModel).all()]
         assert "PagamentoEstornoFalhou.v1" in evts
 
@@ -309,7 +317,8 @@ def test_webhook_assinatura_recusa_e_falha_estorno_recuperavel(tmp_path: Path) -
         rec_ref = BillingConsumidor(db, provedor).reconciliar_operacoes_pendentes()
         assert rec_ref == 1
         pag = db.query(PagamentoModel).filter(PagamentoModel.id == pag_id).first()
-        assert pag is not None and pag.status == "ESTORNADO"
+        assert pag is not None
+        assert pag.status == "ESTORNADO"
 
 
 def test_webhook_recusa_pagamento_emite_evento(tmp_path: Path) -> None:
@@ -355,6 +364,7 @@ def test_webhook_recusa_pagamento_emite_evento(tmp_path: Path) -> None:
 
     with session_factory() as db:
         pag = db.query(PagamentoModel).first()
-        assert pag is not None and pag.status == "RECUSADO"
+        assert pag is not None
+        assert pag.status == "RECUSADO"
         evts = [e.tipo_evento for e in db.query(OutboxEventoModel).all()]
         assert "PagamentoRecusado.v1" in evts

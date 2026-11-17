@@ -310,6 +310,7 @@ def test_criar_orcamento_via_endpoint_e_bloqueio_por_tombstone_persistido(app_cl
             execucao_cancelada_event_id=barreira_evt,
             motivo="FALHA_ENFILEIRAMENTO",
         )
+        db.commit()
         with pytest.raises(ValueError, match="Conflito de barreira"):
             repo.registrar_tombstone_barreira(
                 saga_id=saga_cancelada,

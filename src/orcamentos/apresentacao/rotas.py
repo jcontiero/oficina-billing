@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from src.mensageria.consumidor import confirmar_pagamento_aprovado
 from src.mensageria.outbox_inbox import OutboxEventoModel
 from src.orcamentos.dominio.entidades import (
     ItemOrcamento,
@@ -19,7 +20,6 @@ from src.pagamentos.infraestrutura.mercadopago import (
     ErroComunicacaoProvedorError,
     StatusPagamentoProvedor,
     validar_assinatura_webhook_mp,
-    validar_confirmacao_cobranca,
 )
 from src.shared.seguranca import ActorType, Principal, get_principal_atual
 
@@ -102,6 +102,7 @@ def criar_orcamento_endpoint(
         ],
     )
     repo.salvar(orcamento)
+    db.commit()
     return {
         "id": str(orcamento.id),
         "os_id": str(orcamento.os_id),
@@ -249,6 +250,7 @@ def decidir_orcamento(
         )
     )
     repo.salvar(orcamento)
+    db.commit()
     return {
         "orcamento_id": str(orcamento.id),
         "os_id": str(orcamento.os_id),
@@ -292,6 +294,86 @@ def consultar_pagamento(
     }
 
 
+def _emitir_pagamento_recusado_webhook(
+    db: Session,
+    *,
+    pag: PagamentoModel,
+    data_id: str,
+    motivo: str,
+    environment: str,
+    traceparent: str | None,
+) -> None:
+    evt_id = uuid4()
+    db.add(
+        OutboxEventoModel(
+            id=str(evt_id),
+            event_id=str(evt_id),
+            topic=f"oficina-{environment}-eventos-v1",
+            tipo_evento="PagamentoRecusado.v1",
+            payload={
+                "event_id": str(evt_id),
+                "event_type": "PagamentoRecusado.v1",
+                "schema_version": 1,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "producer": "oficina-billing",
+                "saga_id": pag.saga_id,
+                "os_id": pag.os_id,
+                "correlation_id": pag.saga_id,
+                "causation_id": str(evt_id),
+                "aggregate_version": 4,
+                "payload": {
+                    "rodada": pag.rodada,
+                    "orcamento_id": pag.orcamento_id,
+                    "pagamento_id": pag.id,
+                    "provider_order_id": data_id,
+                    "motivo": motivo,
+                },
+            },
+            traceparent=traceparent,
+            status="PENDENTE",
+        )
+    )
+
+
+def _processar_pagamento_webhook(
+    db: Session,
+    *,
+    request: Request,
+    pag: PagamentoModel,
+    data_id: str,
+) -> None:
+    provedor = request.app.state.provedor_pagamento
+    env = request.app.state.config.environment
+    traceparent = request.headers.get("traceparent")
+    try:
+        ordem = provedor.consultar(data_id)
+        if ordem.status == StatusPagamentoProvedor.CONFIRMADO:
+            confirmar_pagamento_aprovado(
+                db,
+                pag,
+                ordem,
+                environment=env,
+                traceparent=traceparent,
+            )
+        elif ordem.status in {
+            StatusPagamentoProvedor.RECUSADO,
+            StatusPagamentoProvedor.CANCELADO,
+        }:
+            pag.status = ordem.status.value
+            _emitir_pagamento_recusado_webhook(
+                db,
+                pag=pag,
+                data_id=data_id,
+                motivo=ordem.raw_status,
+                environment=env,
+                traceparent=traceparent,
+            )
+    except ErroComunicacaoProvedorError:
+        pag.status = "PENDENTE_RECONCILIACAO"
+    except Exception:
+        pass
+
+
 @router.post("/webhooks/mercadopago", tags=["Pagamentos"])
 def receber_webhook_mercadopago(
     request: Request,
@@ -318,128 +400,21 @@ def receber_webhook_mercadopago(
         .first()
     )
     if existente is None:
-        registro = WebhookInboxModel(
-            request_id=x_request_id,
-            data_id=data_id,
-            action=action,
-            payload_json=json.dumps(payload),
+        db.add(
+            WebhookInboxModel(
+                request_id=x_request_id,
+                data_id=data_id,
+                action=action,
+                payload_json=json.dumps(payload),
+            )
         )
-        db.add(registro)
-
         pag = (
             db.query(PagamentoModel)
             .filter(PagamentoModel.provider_order_id == data_id)
             .first()
         )
         if pag is not None and pag.status != StatusPagamentoProvedor.CONFIRMADO.value:
-            provedor = request.app.state.provedor_pagamento
-            try:
-                ordem = provedor.consultar(data_id)
-                if ordem.status == StatusPagamentoProvedor.CONFIRMADO:
-                    validar_confirmacao_cobranca(
-                        ordem,
-                        pagamento_id_esperado=pag.id,
-                        total_centavos_esperado=pag.total_centavos,
-                        moeda_esperada=pag.moeda,
-                    )
-                    pag.status = StatusPagamentoProvedor.CONFIRMADO.value
-                    orc = OrcamentoRepositorioSql(db).buscar_por_id(
-                        UUID(pag.orcamento_id)
-                    )
-                    itens_servico = []
-                    itens_peca = []
-                    if orc is not None:
-                        itens_servico = [
-                            {
-                                "servico_id": str(i.referencia_id),
-                                "descricao": i.descricao,
-                                "preco_unitario_centavos": i.preco_unitario_centavos,
-                            }
-                            for i in orc.itens
-                            if i.tipo == TipoItemOrcamento.SERVICO
-                        ]
-                        itens_peca = [
-                            {
-                                "peca_id": str(i.referencia_id),
-                                "descricao": i.descricao,
-                                "quantidade": i.quantidade,
-                                "preco_unitario_centavos": i.preco_unitario_centavos,
-                            }
-                            for i in orc.itens
-                            if i.tipo == TipoItemOrcamento.PECA
-                        ]
-                    evt_id = uuid4()
-                    env = request.app.state.config.environment
-                    db.add(
-                        OutboxEventoModel(
-                            id=str(evt_id),
-                            event_id=str(evt_id),
-                            topic=f"oficina-{env}-eventos-v1",
-                            tipo_evento="PagamentoConfirmado.v1",
-                            payload={
-                                "event_id": str(evt_id),
-                                "event_type": "PagamentoConfirmado.v1",
-                                "schema_version": 1,
-                                "occurred_at": datetime.now(timezone.utc).isoformat(),
-                                "producer": "oficina-billing",
-                                "saga_id": pag.saga_id,
-                                "os_id": pag.os_id,
-                                "correlation_id": pag.saga_id,
-                                "causation_id": str(evt_id),
-                                "aggregate_version": 4,
-                                "payload": {
-                                    "orcamento_id": pag.orcamento_id,
-                                    "pagamento_id": pag.id,
-                                    "provider_order_id": data_id,
-                                    "total_centavos": pag.total_centavos,
-                                    "moeda": pag.moeda,
-                                    "orcamento_versao": orc.versao if orc else 1,
-                                    "itens_servico": itens_servico,
-                                    "itens_peca": itens_peca,
-                                },
-                            },
-                            status="PENDENTE",
-                        )
-                    )
-                elif ordem.status in {
-                    StatusPagamentoProvedor.RECUSADO,
-                    StatusPagamentoProvedor.CANCELADO,
-                }:
-                    pag.status = ordem.status.value
-                    evt_id = uuid4()
-                    env = request.app.state.config.environment
-                    db.add(
-                        OutboxEventoModel(
-                            id=str(evt_id),
-                            event_id=str(evt_id),
-                            topic=f"oficina-{env}-eventos-v1",
-                            tipo_evento="PagamentoRecusado.v1",
-                            payload={
-                                "event_id": str(evt_id),
-                                "event_type": "PagamentoRecusado.v1",
-                                "schema_version": 1,
-                                "occurred_at": datetime.now(timezone.utc).isoformat(),
-                                "producer": "oficina-billing",
-                                "saga_id": pag.saga_id,
-                                "os_id": pag.os_id,
-                                "correlation_id": pag.saga_id,
-                                "causation_id": str(evt_id),
-                                "aggregate_version": 4,
-                                "payload": {
-                                    "rodada": pag.rodada,
-                                    "orcamento_id": pag.orcamento_id,
-                                    "pagamento_id": pag.id,
-                                    "provider_order_id": data_id,
-                                    "motivo": ordem.raw_status,
-                                },
-                            },
-                            status="PENDENTE",
-                        )
-                    )
-            except ErroComunicacaoProvedorError:
-                pag.status = "PENDENTE_RECONCILIACAO"
-            except Exception:
-                pass
+            _processar_pagamento_webhook(db, request=request, pag=pag, data_id=data_id)
         db.commit()
 
     return {"status": "received", "data_id": data_id}

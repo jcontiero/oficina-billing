@@ -267,7 +267,7 @@ class MercadoPagoOrdersClient:
             "description": descricao,
             "config": {
                 "qr": {
-                    "pos_id": self.external_pos_id,
+                    "external_pos_id": self.external_pos_id,
                     "mode": "dynamic",
                 }
             },
@@ -299,10 +299,11 @@ class MercadoPagoOrdersClient:
         )
         itens = data.get("elements") or data.get("results") or []
         if not itens and "id" in data:
-            return self._parse_order(data)
-        if not itens:
-            return None
-        return self._parse_order(itens[0])
+            itens = [data]
+        for item in itens:
+            if str(item.get("external_reference", "")) == external_reference:
+                return self._parse_order(item)
+        return None
 
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
