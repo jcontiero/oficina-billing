@@ -25,12 +25,17 @@ spec:
       containers:
         - name: worker
           image: us-east1-docker.pkg.dev/fiap-project-514922/oficina-docker/oficina-billing:latest
-          command: ["python", "-m", "src.worker"]
+          command:
+            - sh
+            - -c
+            - |
+              export DATABASE_URL=$(cat /mnt/secrets-store/DATABASE_URL)
+              export MP_ACCESS_TOKEN=$(cat /mnt/secrets-store/MP_ACCESS_TOKEN)
+              export MP_WEBHOOK_SECRET=$(cat /mnt/secrets-store/MP_WEBHOOK_SECRET)
+              exec python -m src.worker
           envFrom:
             - configMapRef:
                 name: oficina-billing-config
-            - secretRef:
-                name: oficina-billing-secret
           env:
             - name: DD_ENV
               valueFrom:
