@@ -24,3 +24,5 @@ class Configuracoes(BaseSettings):
     mp_external_pos_id: str = "POS001"
     mp_webhook_secret: str = "test-mp-webhook-secret"
     mp_base_url: str = "https://api.mercadopago.com"
+    mp_provider_mode: str = "fake"
+    mp_fake_state_file: str = ""
