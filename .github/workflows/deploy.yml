@@ -99,9 +99,7 @@ jobs:
           for f in /tmp/rendered-k8s/*.yaml; do
             sed -i "s|us-east1-docker.pkg.dev/fiap-project-514922/oficina-docker/oficina-billing:latest|${IMAGE_URI}|g" "$f"
             sed -i "s|oficina-billing-homolog-sa|oficina-billing-${ENV_CANON}-sa|g" "$f"
-            sed -i "s|oficina-billing-database-url-homolog|oficina-billing-database-url-${ENV_CANON}|g" "$f"
-            sed -i "s|oficina-billing-mp-access-token-homolog|oficina-billing-mp-access-token-${ENV_CANON}|g" "$f"
-            sed -i "s|oficina-billing-mp-webhook-secret-homolog|oficina-billing-mp-webhook-secret-${ENV_CANON}|g" "$f"
+            sed -i "s|ENV_PLACEHOLDER|${ENV_CANON}|g" "$f"
             sed -i "s|oficina-backend-homolog|oficina-backend-${ENV_CANON}|g" "$f"
             sed -i "s|oficina-auth-homolog|oficina-auth-${ENV_CANON}|g" "$f"
             sed -i "s|oficina-admin-homolog|oficina-admin-${ENV_CANON}|g" "$f"
