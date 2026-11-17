@@ -67,7 +67,13 @@ def test_reconciliar_exige_autenticacao_e_autorizacao_funcionario(
     )
     assert client.post("/v1/pagamentos/reconciliar").status_code == 403
 
-    # FUNCIONARIO -> 200
+    # MECANICO (FUNCIONARIO sem perfil ADMIN) -> 403
+    app.dependency_overrides[get_principal_atual] = lambda: Principal(
+        id=uuid4(), actor_type=ActorType.FUNCIONARIO, perfil="MECANICO"
+    )
+    assert client.post("/v1/pagamentos/reconciliar").status_code == 403
+
+    # ADMIN -> 200
     app.dependency_overrides[get_principal_atual] = lambda: Principal(
         id=uuid4(), actor_type=ActorType.FUNCIONARIO, perfil="ADMIN"
     )
