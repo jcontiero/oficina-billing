@@ -542,9 +542,13 @@ def reconciliar_pagamentos_pendentes(
     principal: Principal = Depends(get_principal_atual),
     db: Session = Depends(get_db),
 ) -> dict[str, int]:
-    if principal.actor_type != ActorType.STAFF:
+    if (
+        principal.actor_type != ActorType.FUNCIONARIO
+        or (principal.perfil or "").upper() != "ADMIN"
+    ):
         raise HTTPException(
-            status_code=403, detail="Apenas equipe interna pode acionar reconciliação"
+            status_code=403,
+            detail="Apenas perfil ADMIN pode acionar reconciliação financeira",
         )
     from src.mensageria.consumidor import BillingConsumidor
 

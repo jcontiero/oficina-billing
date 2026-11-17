@@ -443,6 +443,134 @@ class BillingConsumidor:
         self.db.commit()
         return "PROCESSADO"
 
+    def _reconciliar_create_order(
+        self, op: ProviderOperationModel, pag: PagamentoModel
+    ) -> int:
+        ordem = (
+            self.provedor.consultar(op.provider_id)
+            if op.provider_id
+            else self.provedor.buscar_por_external_reference(pag.id)
+        )
+        if ordem is None:
+            ordem = self.provedor.criar_cobranca(
+                pagamento_id=pag.id,
+                total_centavos=pag.total_centavos,
+                moeda=pag.moeda,
+                descricao=f"OS {pag.os_id}",
+                idempotency_key=op.idempotency_key,
+            )
+        op.estado = "SUCESSO"
+        op.provider_id = ordem.provider_order_id
+        pag.provider_order_id = ordem.provider_order_id
+        pag.qr_data = ordem.qr_data
+        pag.status = ordem.status.value
+        self._publicar_outbox(
+            event_type="CobrancaCriada.v1",
+            saga_id=UUID(pag.saga_id),
+            os_id=UUID(pag.os_id),
+            correlation_id=UUID(pag.saga_id),
+            causation_id=UUID(pag.id),
+            aggregate_version=2,
+            payload={
+                "rodada": pag.rodada,
+                "orcamento_id": pag.orcamento_id,
+                "pagamento_id": pag.id,
+                "provider_order_id": str(pag.provider_order_id),
+                "qr_data": str(pag.qr_data or ""),
+                "total_centavos": int(pag.total_centavos),
+                "moeda": pag.moeda,
+            },
+        )
+        return 1
+
+    def _reconciliar_refund(
+        self, op: ProviderOperationModel, pag: PagamentoModel
+    ) -> int:
+        if not pag.provider_order_id:
+            return 0
+        try:
+            ordem = self.provedor.consultar(pag.provider_order_id)
+            if ordem.status != StatusPagamentoProvedor.ESTORNADO:
+                ordem = self.provedor.estornar(
+                    pag.provider_order_id, idempotency_key=op.idempotency_key
+                )
+        except (ErroComunicacaoProvedorError, ErroOperacaoProvedorError):
+            return 0
+        if ordem.status != StatusPagamentoProvedor.ESTORNADO:
+            return 0
+        op.estado = "SUCESSO"
+        pag.status = "ESTORNADO"
+        self._publicar_outbox(
+            event_type="PagamentoEstornado.v1",
+            saga_id=UUID(pag.saga_id),
+            os_id=UUID(pag.os_id),
+            correlation_id=UUID(pag.saga_id),
+            causation_id=UUID(pag.id),
+            aggregate_version=4,
+            payload={
+                "rodada": pag.rodada,
+                "compensacao_id": pag.saga_id,
+                "pagamento_id": pag.id,
+                "provider_order_id": pag.provider_order_id,
+                "total_centavos": pag.total_centavos,
+                "moeda": pag.moeda,
+                "resultado": "ESTORNADO",
+                "motivo": "RECONCILIACAO_ESTORNO",
+            },
+        )
+        return 1
+
+    def _reconciliar_pagamento_pendente(self, pag: PagamentoModel) -> int:
+        if not pag.provider_order_id:
+            return 0
+        try:
+            ordem = self.provedor.consultar(pag.provider_order_id)
+        except ErroComunicacaoProvedorError:
+            return 0
+        if ordem.status == StatusPagamentoProvedor.CONFIRMADO:
+            pag.status = StatusPagamentoProvedor.CONFIRMADO.value
+            self._publicar_outbox(
+                event_type="PagamentoConfirmado.v1",
+                saga_id=UUID(pag.saga_id),
+                os_id=UUID(pag.os_id),
+                correlation_id=UUID(pag.saga_id),
+                causation_id=UUID(pag.id),
+                aggregate_version=4,
+                payload={
+                    "orcamento_id": pag.orcamento_id,
+                    "pagamento_id": pag.id,
+                    "provider_order_id": pag.provider_order_id,
+                    "total_centavos": pag.total_centavos,
+                    "moeda": pag.moeda,
+                    "orcamento_versao": 1,
+                    "itens_servico": [],
+                    "itens_peca": [],
+                },
+            )
+            return 1
+        if ordem.status in {
+            StatusPagamentoProvedor.RECUSADO,
+            StatusPagamentoProvedor.CANCELADO,
+        }:
+            pag.status = ordem.status.value
+            self._publicar_outbox(
+                event_type="PagamentoRecusado.v1",
+                saga_id=UUID(pag.saga_id),
+                os_id=UUID(pag.os_id),
+                correlation_id=UUID(pag.saga_id),
+                causation_id=UUID(pag.id),
+                aggregate_version=4,
+                payload={
+                    "rodada": pag.rodada,
+                    "orcamento_id": pag.orcamento_id,
+                    "pagamento_id": pag.id,
+                    "provider_order_id": pag.provider_order_id,
+                    "motivo": ordem.raw_status,
+                },
+            )
+            return 1
+        return 0
+
     def reconciliar_operacoes_pendentes(self) -> int:
         """
         Reconcilia operações em estado DESCONHECIDO (timeout de rede/5xx) ou pagamentos
@@ -462,73 +590,10 @@ class BillingConsumidor:
             )
             if pag is None:
                 continue
-
             if op.tipo == "CREATE_ORDER":
-                ordem = (
-                    self.provedor.consultar(op.provider_id)
-                    if op.provider_id
-                    else self.provedor.buscar_por_external_reference(pag.id)
-                )
-                if ordem is None:
-                    ordem = self.provedor.criar_cobranca(
-                        pagamento_id=pag.id,
-                        total_centavos=pag.total_centavos,
-                        moeda=pag.moeda,
-                        descricao=f"OS {pag.os_id}",
-                        idempotency_key=op.idempotency_key,
-                    )
-                op.estado = "SUCESSO"
-                op.provider_id = ordem.provider_order_id
-                pag.provider_order_id = ordem.provider_order_id
-                pag.qr_data = ordem.qr_data
-                pag.status = ordem.status.value
-                self._publicar_outbox(
-                    event_type="CobrancaCriada.v1",
-                    saga_id=UUID(pag.saga_id),
-                    os_id=UUID(pag.os_id),
-                    correlation_id=UUID(pag.saga_id),
-                    causation_id=UUID(pag.id),
-                    aggregate_version=2,
-                    payload={
-                        "rodada": pag.rodada,
-                        "orcamento_id": pag.orcamento_id,
-                        "pagamento_id": pag.id,
-                        "provider_order_id": str(pag.provider_order_id),
-                        "qr_data": str(pag.qr_data or ""),
-                        "total_centavos": int(pag.total_centavos),
-                        "moeda": pag.moeda,
-                    },
-                )
-                reconciliadas += 1
-
-            elif op.tipo == "REFUND" and pag.provider_order_id:
-                ordem = self.provedor.consultar(pag.provider_order_id)
-                if ordem.status != StatusPagamentoProvedor.ESTORNADO:
-                    ordem = self.provedor.estornar(
-                        pag.provider_order_id, idempotency_key=op.idempotency_key
-                    )
-                if ordem.status == StatusPagamentoProvedor.ESTORNADO:
-                    op.estado = "SUCESSO"
-                    pag.status = "ESTORNADO"
-                    self._publicar_outbox(
-                        event_type="PagamentoEstornado.v1",
-                        saga_id=UUID(pag.saga_id),
-                        os_id=UUID(pag.os_id),
-                        correlation_id=UUID(pag.saga_id),
-                        causation_id=UUID(pag.id),
-                        aggregate_version=4,
-                        payload={
-                            "rodada": pag.rodada,
-                            "compensacao_id": pag.saga_id,
-                            "pagamento_id": pag.id,
-                            "provider_order_id": pag.provider_order_id,
-                            "total_centavos": pag.total_centavos,
-                            "moeda": pag.moeda,
-                            "resultado": "ESTORNADO",
-                            "motivo": "RECONCILIACAO_ESTORNO",
-                        },
-                    )
-                    reconciliadas += 1
+                reconciliadas += self._reconciliar_create_order(op, pag)
+            elif op.tipo == "REFUND":
+                reconciliadas += self._reconciliar_refund(op, pag)
 
         pags_rec = (
             self.db.query(PagamentoModel)
@@ -536,54 +601,7 @@ class BillingConsumidor:
             .all()
         )
         for pag in pags_rec:
-            if not pag.provider_order_id:
-                continue
-            try:
-                ordem = self.provedor.consultar(pag.provider_order_id)
-            except ErroComunicacaoProvedorError:
-                continue
-            if ordem.status == StatusPagamentoProvedor.CONFIRMADO:
-                pag.status = StatusPagamentoProvedor.CONFIRMADO.value
-                self._publicar_outbox(
-                    event_type="PagamentoConfirmado.v1",
-                    saga_id=UUID(pag.saga_id),
-                    os_id=UUID(pag.os_id),
-                    correlation_id=UUID(pag.saga_id),
-                    causation_id=UUID(pag.id),
-                    aggregate_version=4,
-                    payload={
-                        "orcamento_id": pag.orcamento_id,
-                        "pagamento_id": pag.id,
-                        "provider_order_id": pag.provider_order_id,
-                        "total_centavos": pag.total_centavos,
-                        "moeda": pag.moeda,
-                        "orcamento_versao": 1,
-                        "itens_servico": [],
-                        "itens_peca": [],
-                    },
-                )
-                reconciliadas += 1
-            elif ordem.status in {
-                StatusPagamentoProvedor.RECUSADO,
-                StatusPagamentoProvedor.CANCELADO,
-            }:
-                pag.status = ordem.status.value
-                self._publicar_outbox(
-                    event_type="PagamentoRecusado.v1",
-                    saga_id=UUID(pag.saga_id),
-                    os_id=UUID(pag.os_id),
-                    correlation_id=UUID(pag.saga_id),
-                    causation_id=UUID(pag.id),
-                    aggregate_version=4,
-                    payload={
-                        "rodada": pag.rodada,
-                        "orcamento_id": pag.orcamento_id,
-                        "pagamento_id": pag.id,
-                        "provider_order_id": pag.provider_order_id,
-                        "motivo": ordem.raw_status,
-                    },
-                )
-                reconciliadas += 1
+            reconciliadas += self._reconciliar_pagamento_pendente(pag)
 
         if reconciliadas > 0:
             self.db.commit()
