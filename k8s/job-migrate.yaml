@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oficina-billing-migrate
+  labels:
+    app: oficina-billing-migrate
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: oficina-billing-sa
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: us-east1-docker.pkg.dev/fiap-project-514922/oficina-docker/oficina-billing:latest
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: oficina-billing-config
+            - secretRef:
+                name: oficina-billing-secret
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: oficina-billing-secrets
