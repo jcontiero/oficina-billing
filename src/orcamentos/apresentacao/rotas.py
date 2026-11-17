@@ -16,6 +16,7 @@ from src.orcamentos.dominio.entidades import (
 from src.orcamentos.infraestrutura.modelos import PagamentoModel, WebhookInboxModel
 from src.orcamentos.infraestrutura.repositorios import OrcamentoRepositorioSql
 from src.pagamentos.infraestrutura.mercadopago import (
+    ErroComunicacaoProvedorError,
     StatusPagamentoProvedor,
     validar_assinatura_webhook_mp,
     validar_confirmacao_cobranca,
@@ -400,6 +401,43 @@ def receber_webhook_mercadopago(
                             status="PENDENTE",
                         )
                     )
+                elif ordem.status in {
+                    StatusPagamentoProvedor.RECUSADO,
+                    StatusPagamentoProvedor.CANCELADO,
+                }:
+                    pag.status = ordem.status.value
+                    evt_id = uuid4()
+                    env = request.app.state.config.environment
+                    db.add(
+                        OutboxEventoModel(
+                            id=str(evt_id),
+                            event_id=str(evt_id),
+                            topic=f"oficina-{env}-eventos-v1",
+                            tipo_evento="PagamentoRecusado.v1",
+                            payload={
+                                "event_id": str(evt_id),
+                                "event_type": "PagamentoRecusado.v1",
+                                "schema_version": 1,
+                                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                                "producer": "oficina-billing",
+                                "saga_id": pag.saga_id,
+                                "os_id": pag.os_id,
+                                "correlation_id": pag.saga_id,
+                                "causation_id": str(evt_id),
+                                "aggregate_version": 4,
+                                "payload": {
+                                    "rodada": pag.rodada,
+                                    "orcamento_id": pag.orcamento_id,
+                                    "pagamento_id": pag.id,
+                                    "provider_order_id": data_id,
+                                    "motivo": ordem.raw_status,
+                                },
+                            },
+                            status="PENDENTE",
+                        )
+                    )
+            except ErroComunicacaoProvedorError:
+                pag.status = "PENDENTE_RECONCILIACAO"
             except Exception:
                 pass
         db.commit()
@@ -482,3 +520,37 @@ def simular_pagamento_fake_e2e(
     provedor = request.app.state.provedor_pagamento
     headers, body = provedor.simular_pagamento_aprovado(provider_order_id)
     return {"headers": headers, "body": body}
+
+
+@router.post("/internal/fake-mp/{provider_order_id}/recusar", tags=["Pagamentos"])
+def simular_recusa_fake_e2e(
+    provider_order_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    if request.app.state.config.mp_provider_mode != "fake":
+        raise HTTPException(
+            status_code=404, detail="Disponível apenas quando mp_provider_mode=fake"
+        )
+    provedor = request.app.state.provedor_pagamento
+    headers, body = provedor.simular_pagamento_recusado(provider_order_id)
+    return {"headers": headers, "body": body}
+
+
+@router.post("/v1/pagamentos/reconciliar", tags=["Pagamentos"])
+def reconciliar_pagamentos_pendentes(
+    request: Request,
+    principal: Principal = Depends(get_principal_atual),
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    if principal.actor_type != ActorType.STAFF:
+        raise HTTPException(
+            status_code=403, detail="Apenas equipe interna pode acionar reconciliação"
+        )
+    from src.mensageria.consumidor import BillingConsumidor
+
+    consumidor = BillingConsumidor(
+        db,
+        request.app.state.provedor_pagamento,
+        environment=request.app.state.config.environment,
+    )
+    return {"reconciliadas": consumidor.reconciliar_operacoes_pendentes()}

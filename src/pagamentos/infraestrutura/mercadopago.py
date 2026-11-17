@@ -54,6 +54,10 @@ class ProvedorPagamento(Protocol):
 
     def consultar(self, provider_order_id: str) -> ResultadoOrdemProvedor: ...
 
+    def buscar_por_external_reference(
+        self, external_reference: str
+    ) -> ResultadoOrdemProvedor | None: ...
+
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
     ) -> ResultadoOrdemProvedor: ...
@@ -287,6 +291,19 @@ class MercadoPagoOrdersClient:
         data = self._request("GET", f"/v1/orders/{provider_order_id}")
         return self._parse_order(data)
 
+    def buscar_por_external_reference(
+        self, external_reference: str
+    ) -> ResultadoOrdemProvedor | None:
+        data = self._request(
+            "GET", f"/v1/orders?external_reference={external_reference}"
+        )
+        itens = data.get("elements") or data.get("results") or []
+        if not itens and "id" in data:
+            return self._parse_order(data)
+        if not itens:
+            return None
+        return self._parse_order(itens[0])
+
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
     ) -> ResultadoOrdemProvedor:
@@ -327,7 +344,29 @@ class FakeMercadoPagoOrdersProvider:
         self._orders: dict[str, ResultadoOrdemProvedor] = {}
         self._idempotency_cache: dict[str, ResultadoOrdemProvedor] = {}
         self._seq = 0
+        self._proxima_falha: Exception | None = None
+        self._falha_apos_efeito: bool = False
         self._load_state()
+
+    def configurar_falha(
+        self, exc: Exception | None, *, apos_efeito: bool = False
+    ) -> None:
+        """Configura falha determinística na próxima chamada (ex: timeout após efeito)."""
+        self._proxima_falha = exc
+        self._falha_apos_efeito = apos_efeito
+
+    def _consumir_falha_pre(self) -> None:
+        if self._proxima_falha is not None and not self._falha_apos_efeito:
+            exc = self._proxima_falha
+            self._proxima_falha = None
+            raise exc
+
+    def _consumir_falha_pos(self) -> None:
+        if self._proxima_falha is not None and self._falha_apos_efeito:
+            exc = self._proxima_falha
+            self._proxima_falha = None
+            self._falha_apos_efeito = False
+            raise exc
 
     def _load_state(self) -> None:
         if not self.state_file or not self.state_file.exists():
@@ -369,6 +408,7 @@ class FakeMercadoPagoOrdersProvider:
         descricao: str,
         idempotency_key: str,
     ) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         if idempotency_key in self._idempotency_cache:
             return self._idempotency_cache[idempotency_key]
 
@@ -390,13 +430,25 @@ class FakeMercadoPagoOrdersProvider:
         self._orders[order_id] = ordem
         self._idempotency_cache[idempotency_key] = ordem
         self._save_state()
+        self._consumir_falha_pos()
         return ordem
 
     def consultar(self, provider_order_id: str) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         self._load_state()
         if provider_order_id not in self._orders:
             raise ErroOperacaoProvedorError(f"Order {provider_order_id} não encontrada")
         return self._orders[provider_order_id]
+
+    def buscar_por_external_reference(
+        self, external_reference: str
+    ) -> ResultadoOrdemProvedor | None:
+        self._consumir_falha_pre()
+        self._load_state()
+        for ordem in self._orders.values():
+            if ordem.external_reference == external_reference:
+                return ordem
+        return None
 
     def simular_pagamento_aprovado(
         self,
@@ -436,9 +488,50 @@ class FakeMercadoPagoOrdersProvider:
         }
         return headers, body
 
+    def simular_pagamento_recusado(
+        self,
+        provider_order_id: str,
+        *,
+        motivo_raw: str = "failed",
+        x_request_id: str = "req-webhook-recusa-001",
+        ts: str = "1763305201",
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        atual = self.consultar(provider_order_id)
+        if atual.status == StatusPagamentoProvedor.CONFIRMADO:
+            raise ErroOperacaoProvedorError("Order já confirmada não pode ser recusada")
+        status_mapped = mapear_status_order_mp(motivo_raw)
+        atualizada = ResultadoOrdemProvedor(
+            provider_order_id=atual.provider_order_id,
+            external_reference=atual.external_reference,
+            status=status_mapped,
+            total_centavos=atual.total_centavos,
+            moeda=atual.moeda,
+            qr_data=atual.qr_data,
+            raw_status=motivo_raw,
+        )
+        self._orders[provider_order_id] = atualizada
+        self._save_state()
+        assinatura = gerar_assinatura_webhook_mp(
+            data_id=provider_order_id,
+            x_request_id=x_request_id,
+            ts=ts,
+            webhook_secret=self.webhook_secret,
+        )
+        headers = {
+            "x-signature": assinatura,
+            "x-request-id": x_request_id,
+        }
+        body = {
+            "action": f"order.{motivo_raw}",
+            "type": "order",
+            "data": {"id": provider_order_id},
+        }
+        return headers, body
+
     def cancelar(
         self, provider_order_id: str, *, idempotency_key: str
     ) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         if idempotency_key in self._idempotency_cache:
             return self._idempotency_cache[idempotency_key]
 
@@ -458,11 +551,14 @@ class FakeMercadoPagoOrdersProvider:
         )
         self._orders[provider_order_id] = cancelada
         self._idempotency_cache[idempotency_key] = cancelada
+        self._save_state()
+        self._consumir_falha_pos()
         return cancelada
 
     def estornar(
         self, provider_order_id: str, *, idempotency_key: str
     ) -> ResultadoOrdemProvedor:
+        self._consumir_falha_pre()
         if idempotency_key in self._idempotency_cache:
             return self._idempotency_cache[idempotency_key]
 
@@ -482,4 +578,6 @@ class FakeMercadoPagoOrdersProvider:
         )
         self._orders[provider_order_id] = estornada
         self._idempotency_cache[idempotency_key] = estornada
+        self._save_state()
+        self._consumir_falha_pos()
         return estornada
