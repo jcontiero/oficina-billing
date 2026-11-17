@@ -217,22 +217,22 @@ class BillingConsumidor:
             ItemOrcamento(
                 id=uuid4(),
                 tipo=TipoItemOrcamento.SERVICO,
-                referencia_id=UUID(str(s["servico_id"])),
-                descricao=str(s["descricao"]),
-                quantidade=1,
+                referencia_id=UUID(str(s.get("servico_id") or s.get("id"))),
+                descricao=str(s.get("descricao") or s.get("nome") or "Serviço"),
+                quantidade=int(s.get("quantidade", 1)),
                 preco_unitario_centavos=int(s["preco_unitario_centavos"]),
             )
-            for s in p["itens_servico"]
+            for s in p.get("itens_servico", [])
         ] + [
             ItemOrcamento(
                 id=uuid4(),
                 tipo=TipoItemOrcamento.PECA,
-                referencia_id=UUID(str(pc["peca_id"])),
-                descricao=str(pc["descricao"]),
-                quantidade=int(pc["quantidade"]),
+                referencia_id=UUID(str(pc.get("peca_id") or pc.get("id"))),
+                descricao=str(pc.get("descricao") or pc.get("nome") or "Peça"),
+                quantidade=int(pc.get("quantidade", 1)),
                 preco_unitario_centavos=int(pc["preco_unitario_centavos"]),
             )
-            for pc in p["itens_peca"]
+            for pc in p.get("itens_peca", [])
         ]
 
         orcamento = criar_orcamento_congelado(
