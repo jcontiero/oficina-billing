@@ -623,7 +623,7 @@ class BillingConsumidor:
 
     def _processar_estornar_ou_cancelar_cobranca(
         self, envelope: Any, traceparent: str | None, *, evento_sucesso: str
-    ) -> str:
+    ) -> None:
         p = envelope.payload
         self.repo.registrar_tombstone_barreira(
             saga_id=envelope.saga_id,
@@ -635,7 +635,7 @@ class BillingConsumidor:
         pag = self.repo.buscar_pagamento_por_id(UUID(str(p["pagamento_id"])))
         if pag is None:
             self.db.commit()
-            return "PROCESSADO"
+            return
 
         if pag.status in {
             "CONFIRMADO",
@@ -651,7 +651,6 @@ class BillingConsumidor:
                 pag, envelope, traceparent, evento_sucesso=evento_sucesso
             )
         self.db.commit()
-        return "PROCESSADO"
 
     def processar_comando(
         self,
@@ -672,13 +671,15 @@ class BillingConsumidor:
         if evt == "CancelarOrcamento.v1":
             return self._processar_cancelar_orcamento(envelope, traceparent)
         if evt == "EstornarPagamento.v1":
-            return self._processar_estornar_ou_cancelar_cobranca(
+            self._processar_estornar_ou_cancelar_cobranca(
                 envelope, traceparent, evento_sucesso=EVT_PAGAMENTO_ESTORNADO
             )
+            return "PROCESSADO"
         if evt == "CancelarCobranca.v1":
-            return self._processar_estornar_ou_cancelar_cobranca(
+            self._processar_estornar_ou_cancelar_cobranca(
                 envelope, traceparent, evento_sucesso=EVT_COBRANCA_CANCELADA
             )
+            return "PROCESSADO"
         self.db.commit()
         return "PROCESSADO"
 

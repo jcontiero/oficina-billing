@@ -11,7 +11,11 @@ from sqlalchemy.orm import sessionmaker
 
 from src.mensageria.consumidor import BillingConsumidor
 from src.mensageria.outbox_inbox import InboxEventoModel, OutboxEventoModel
-from src.orcamentos.infraestrutura.modelos import OrcamentoModel, PagamentoModel
+from src.orcamentos.infraestrutura.modelos import (
+    OrcamentoModel,
+    PagamentoModel,
+    ProviderOperationModel,
+)
 from src.pagamentos.infraestrutura.mercadopago import (
     ErroComunicacaoProvedorError,
     ErroDivergenciaConfirmacaoError,
@@ -207,8 +211,9 @@ def test_r09_reconciliacao_valida_divergencia_e_preserva_itens_orcamento(
         pag.status = "PENDENTE_RECONCILIACAO"
         pag.total_centavos = 99999
         db.commit()
+        cons_rec = BillingConsumidor(db, provedor)
         with pytest.raises(ErroDivergenciaConfirmacaoError):
-            BillingConsumidor(db, provedor).reconciliar_operacoes_pendentes()
+            cons_rec.reconciliar_operacoes_pendentes()
 
 
 def test_r10_cancelar_cobranca_v1_tratado(tmp_path: Path) -> None:
@@ -312,3 +317,64 @@ def test_r12_contrato_mp_external_pos_id_e_busca_exata() -> None:
     assert encontrada is not None
     assert encontrada.provider_order_id == "ORD_ALVO"
     assert encontrada.status == StatusPagamentoProvedor.PENDENTE
+
+
+def test_r03_reconciliar_cancelamento_pendente_emite_cobranca_cancelada(
+    tmp_path: Path,
+) -> None:
+    Session = _session(tmp_path)
+    provedor = FakeMercadoPagoOrdersProvider()
+    saga_id = uuid4()
+    os_id = uuid4()
+    with Session() as db:
+        cons = BillingConsumidor(db, provedor)
+        cons.processar_comando(
+            _cmd(
+                "CriarCobranca.v1",
+                saga_id=saga_id,
+                os_id=os_id,
+                payload={
+                    "rodada": 1,
+                    "orcamento_id": str(uuid4()),
+                    "orcamento_versao": 1,
+                    "cliente_id": str(uuid4()),
+                    "total_centavos": 12000,
+                    "moeda": "BRL",
+                },
+            )
+        )
+        pag = db.query(PagamentoModel).one()
+        pag_id = pag.id
+
+    provedor.configurar_falha(ErroComunicacaoProvedorError("timeout cancel"))
+    with Session() as db:
+        BillingConsumidor(db, provedor).processar_comando(
+            _cmd(
+                "CancelarCobranca.v1",
+                saga_id=saga_id,
+                os_id=os_id,
+                payload={
+                    "rodada": 1,
+                    "compensacao_id": str(uuid4()),
+                    "motivo": "TIMEOUT",
+                    "pagamento_id": pag_id,
+                    "execucao_cancelada_event_id": str(uuid4()),
+                },
+            )
+        )
+        pag = db.query(PagamentoModel).one()
+        assert pag.status == "CANCELAMENTO_PENDENTE"
+        op = (
+            db.query(ProviderOperationModel)
+            .filter(ProviderOperationModel.tipo == "CANCEL_ORDER")
+            .one()
+        )
+        assert op.estado == "DESCONHECIDO"
+
+    with Session() as db:
+        assert BillingConsumidor(db, provedor).reconciliar_operacoes_pendentes() == 1
+        pag = db.query(PagamentoModel).one()
+        assert pag.status == "CANCELADO"
+        evts = [e.tipo_evento for e in db.query(OutboxEventoModel).all()]
+        assert "PagamentoEstornoPendente.v1" in evts
+        assert "PagamentoEstornado.v1" in evts
