@@ -177,16 +177,19 @@ class BillingConsumidor:
         )
         return event_id
 
-    def _registrar_inbox(self, consumer: str, envelope: Any) -> bool:
-        ja_processado = (
+    def _ja_processado_inbox(self, consumer: str, envelope: Any) -> bool:
+        return (
             self.db.query(InboxEventoModel)
             .filter(
                 InboxEventoModel.consumer == consumer,
                 InboxEventoModel.event_id == str(envelope.event_id),
             )
             .first()
+            is not None
         )
-        if ja_processado is not None:
+
+    def _registrar_inbox(self, consumer: str, envelope: Any) -> bool:
+        if self._ja_processado_inbox(consumer, envelope):
             return False
 
         try:
@@ -260,8 +263,15 @@ class BillingConsumidor:
         self.db.commit()
         return "PROCESSADO"
 
-    def _processar_criar_cobranca(self, envelope: Any, traceparent: str | None) -> str:
+    def _processar_criar_cobranca(
+        self,
+        envelope: Any,
+        traceparent: str | None,
+        *,
+        consumer: str = "billing-comandos",
+    ) -> str:
         if self.repo.buscar_tombstone_por_saga(envelope.saga_id) is not None:
+            self._registrar_inbox(consumer, envelope)
             self.db.commit()
             return "BLOQUEADO_TOMBSTONE"
 
@@ -271,72 +281,69 @@ class BillingConsumidor:
             .filter(PagamentoModel.saga_id == str(envelope.saga_id))
             .first()
         )
+        idem_key = f"create-{envelope.saga_id}-{p['rodada']}"
         if pag_existente is None:
-            pag_id = uuid4()
-            idem_key = f"create-{envelope.saga_id}-{p['rodada']}"
-            req_hash = hashlib.sha256(
-                json.dumps(p, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-
-            op = ProviderOperationModel(
-                pagamento_id=str(pag_id),
-                saga_id=str(envelope.saga_id),
+            pag_id = str(uuid4())
+            op = self._obter_ou_criar_operacao(
+                pagamento_id=pag_id,
+                saga_id=envelope.saga_id,
                 idempotency_key=idem_key,
                 tipo="CREATE_ORDER",
-                estado="PENDENTE",
-                request_hash=req_hash,
+                provider_id=None,
+                payload=p,
             )
-            self.db.add(op)
-            self.db.flush()
-
-            try:
-                ordem = self.provedor.criar_cobranca(
-                    pagamento_id=str(pag_id),
-                    total_centavos=int(p["total_centavos"]),
-                    moeda=str(p["moeda"]),
-                    descricao=f"OS {envelope.os_id}",
-                    idempotency_key=idem_key,
-                )
-            except ErroComunicacaoProvedorError:
-                op.estado = "DESCONHECIDO"
-                self.db.add(
-                    PagamentoModel(
-                        id=str(pag_id),
-                        orcamento_id=str(p["orcamento_id"]),
-                        os_id=str(envelope.os_id),
-                        saga_id=str(envelope.saga_id),
-                        cliente_id=str(p["cliente_id"]),
-                        rodada=int(p["rodada"]),
-                        provider_order_id=None,
-                        qr_data=None,
-                        status="PENDENTE_RECONCILIACAO",
-                        total_centavos=int(p["total_centavos"]),
-                        moeda=str(p["moeda"]),
-                    )
-                )
-                self.db.commit()
-                return "PENDENTE_RECONCILIACAO"
-
-            op.estado = "SUCESSO"
-            op.provider_id = ordem.provider_order_id
             pag_existente = PagamentoModel(
-                id=str(pag_id),
+                id=pag_id,
                 orcamento_id=str(p["orcamento_id"]),
                 os_id=str(envelope.os_id),
                 saga_id=str(envelope.saga_id),
                 cliente_id=str(p["cliente_id"]),
                 rodada=int(p["rodada"]),
-                provider_order_id=ordem.provider_order_id,
-                qr_data=ordem.qr_data,
-                status=ordem.status.value,
-                total_centavos=ordem.total_centavos,
-                moeda=ordem.moeda,
+                provider_order_id=None,
+                qr_data=None,
+                status="PENDENTE_RECONCILIACAO",
+                total_centavos=int(p["total_centavos"]),
+                moeda=str(p["moeda"]),
             )
             self.db.add(pag_existente)
+            # Persiste a intenção durável antes de qualquer chamada externa
+            self.db.commit()
+        else:
+            op = self._obter_ou_criar_operacao(
+                pagamento_id=pag_existente.id,
+                saga_id=envelope.saga_id,
+                idempotency_key=idem_key,
+                tipo="CREATE_ORDER",
+                provider_id=pag_existente.provider_order_id,
+                payload=p,
+            )
 
         if pag_existente.status == "PENDENTE_RECONCILIACAO":
-            self.db.commit()
-            return "PENDENTE_RECONCILIACAO"
+            try:
+                ordem = (
+                    self.provedor.consultar(op.provider_id)
+                    if op.provider_id
+                    else self.provedor.buscar_por_external_reference(pag_existente.id)
+                )
+                if ordem is None:
+                    ordem = self.provedor.criar_cobranca(
+                        pagamento_id=pag_existente.id,
+                        total_centavos=int(p["total_centavos"]),
+                        moeda=str(p["moeda"]),
+                        descricao=f"OS {envelope.os_id}",
+                        idempotency_key=op.idempotency_key,
+                    )
+            except ErroComunicacaoProvedorError:
+                op.estado = "DESCONHECIDO"
+                self._registrar_inbox(consumer, envelope)
+                self.db.commit()
+                return "PENDENTE_RECONCILIACAO"
+
+            op.estado = "SUCESSO"
+            op.provider_id = ordem.provider_order_id
+            pag_existente.provider_order_id = ordem.provider_order_id
+            pag_existente.qr_data = ordem.qr_data
+            pag_existente.status = ordem.status.value
 
         self._publicar_outbox(
             event_type="CobrancaCriada.v1",
@@ -356,6 +363,7 @@ class BillingConsumidor:
             },
             traceparent=traceparent,
         )
+        self._registrar_inbox(consumer, envelope)
         self.db.commit()
         return "PROCESSADO"
 
@@ -447,6 +455,7 @@ class BillingConsumidor:
             provider_id=pag.provider_order_id,
             payload=p,
         )
+        self.db.commit()
         try:
             estorno = self.provedor.estornar(
                 str(pag.provider_order_id),
@@ -660,14 +669,20 @@ class BillingConsumidor:
         traceparent: str | None = None,
     ) -> str:
         envelope = validar_comando_billing_v1(dados)
-        if not self._registrar_inbox(consumer, envelope):
+        if self._ja_processado_inbox(consumer, envelope):
             return "DUPLICADO"
 
         evt = envelope.event_type
+        if evt == "CriarCobranca.v1":
+            return self._processar_criar_cobranca(
+                envelope, traceparent, consumer=consumer
+            )
+
+        if not self._registrar_inbox(consumer, envelope):
+            return "DUPLICADO"
+
         if evt == "GerarOrcamento.v1":
             return self._processar_gerar_orcamento(envelope, traceparent)
-        if evt == "CriarCobranca.v1":
-            return self._processar_criar_cobranca(envelope, traceparent)
         if evt == "CancelarOrcamento.v1":
             return self._processar_cancelar_orcamento(envelope, traceparent)
         if evt == "EstornarPagamento.v1":
@@ -849,7 +864,7 @@ class BillingConsumidor:
         reconciliadas = 0
         ops = (
             self.db.query(ProviderOperationModel)
-            .filter(ProviderOperationModel.estado == "DESCONHECIDO")
+            .filter(ProviderOperationModel.estado.in_(["PENDENTE", "DESCONHECIDO"]))
             .all()
         )
         for op in ops:

@@ -378,3 +378,68 @@ def test_r03_reconciliar_cancelamento_pendente_emite_cobranca_cancelada(
         evts = [e.tipo_evento for e in db.query(OutboxEventoModel).all()]
         assert "PagamentoEstornoPendente.v1" in evts
         assert "PagamentoEstornado.v1" in evts
+
+
+def test_intencao_financeira_duravel_sobrevive_a_queda_apos_efeito_externo(
+    tmp_path: Path,
+) -> None:
+    Session = _session(tmp_path)
+    provedor = FakeMercadoPagoOrdersProvider()
+    saga_id = uuid4()
+    os_id = uuid4()
+    cmd = _cmd(
+        "CriarCobranca.v1",
+        saga_id=saga_id,
+        os_id=os_id,
+        payload={
+            "rodada": 1,
+            "orcamento_id": str(uuid4()),
+            "orcamento_versao": 1,
+            "cliente_id": str(uuid4()),
+            "total_centavos": 22000,
+            "moeda": "BRL",
+        },
+    )
+
+    # Simula queda do processo imediatamente após a chamada externa e antes do commit final
+    with Session() as db:
+        orig_commit = db.commit
+        chamadas_commit = 0
+
+        def _crash_on_final_commit():
+            nonlocal chamadas_commit
+            chamadas_commit += 1
+            # Se houver apenas 1 commit no final, falha nele; se houver commit prévio da intenção, falha no 2o
+            if chamadas_commit >= 2 or provedor._seq >= 1:
+                raise RuntimeError("crash antes do commit final")
+            orig_commit()
+
+        db.commit = _crash_on_final_commit  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="crash antes do commit final"):
+            BillingConsumidor(db, provedor).processar_comando(cmd)
+        db.rollback()
+
+    # Intenção durável precisa estar persistida no banco após a queda
+    with Session() as db:
+        op = db.query(ProviderOperationModel).first()
+        pag = db.query(PagamentoModel).first()
+        assert op is not None
+        assert op.tipo == "CREATE_ORDER"
+        assert op.estado == "PENDENTE"
+        assert pag is not None
+        pag_id_original = pag.id
+        idem_original = op.idempotency_key
+        assert db.query(OutboxEventoModel).count() == 0
+
+    # Reconciliação recupera a ordem criada sem chamar criar_cobranca novamente
+    with Session() as db:
+        assert BillingConsumidor(db, provedor).reconciliar_operacoes_pendentes() == 1
+        op = db.query(ProviderOperationModel).one()
+        pag = db.query(PagamentoModel).one()
+        out = db.query(OutboxEventoModel).one()
+        assert op.estado == "SUCESSO"
+        assert op.idempotency_key == idem_original
+        assert pag.id == pag_id_original
+        assert pag.provider_order_id == "ORD_TEST_000001"
+        assert out.tipo_evento == "CobrancaCriada.v1"
+        assert provedor._seq == 1
