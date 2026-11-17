@@ -23,6 +23,7 @@ spec:
         tags.datadoghq.com/service: oficina-billing
     spec:
       serviceAccountName: oficina-billing-sa
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

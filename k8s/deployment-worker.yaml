@@ -17,6 +17,7 @@ spec:
         tags.datadoghq.com/service: oficina-billing-worker
     spec:
       serviceAccountName: oficina-billing-sa
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -43,6 +44,13 @@ spec:
                   fieldPath: status.hostIP
             - name: DD_TRACE_AGENT_PORT
               value: "8126"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
           volumeMounts:
             - name: secrets-store
               mountPath: /mnt/secrets-store

@@ -9,6 +9,7 @@ spec:
   template:
     spec:
       serviceAccountName: oficina-billing-sa
+      automountServiceAccountToken: false
       restartPolicy: OnFailure
       containers:
         - name: migrate
@@ -19,6 +20,13 @@ spec:
                 name: oficina-billing-config
             - secretRef:
                 name: oficina-billing-secret
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
           volumeMounts:
             - name: secrets-store
               mountPath: /mnt/secrets-store
