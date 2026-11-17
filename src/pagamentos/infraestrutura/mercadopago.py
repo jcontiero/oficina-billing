@@ -6,6 +6,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 import httpx
 
@@ -414,7 +415,8 @@ class FakeMercadoPagoOrdersProvider:
             return self._idempotency_cache[idempotency_key]
 
         self._seq += 1
-        order_id = f"ORD_TEST_{self._seq:06d}"
+        suffix = uuid4().hex[:6].upper()
+        order_id = f"ORD_{self._seq:04d}_{suffix}"
         qr_data = (
             f"00020101021243650016COM.MERCADOLIBRE020130636{order_id}"
             f"5204000053039865406{centavos_para_decimal_str(total_centavos)}"
