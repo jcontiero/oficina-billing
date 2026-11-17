@@ -438,7 +438,44 @@ class FakeMercadoPagoOrdersProvider:
         self._consumir_falha_pre()
         self._load_state()
         if provider_order_id not in self._orders:
-            raise ErroOperacaoProvedorError(f"Order {provider_order_id} não encontrada")
+            from src.orcamentos.infraestrutura.modelos import PagamentoModel
+            from src.config import Configuracoes
+            from sqlalchemy import create_engine
+            from sqlalchemy.orm import Session
+            try:
+                cfg = Configuracoes()
+                if cfg.database_url:
+                    engine = create_engine(cfg.database_url)
+                    with Session(engine) as session:
+                        pag = (
+                            session.query(PagamentoModel)
+                            .filter(PagamentoModel.provider_order_id == provider_order_id)
+                            .first()
+                        )
+                        if pag is not None:
+                            status_map = {
+                                "PENDENTE": StatusPagamentoProvedor.PENDENTE,
+                                "CONFIRMADO": StatusPagamentoProvedor.CONFIRMADO,
+                                "RECUSADO": StatusPagamentoProvedor.RECUSADO,
+                                "CANCELADO": StatusPagamentoProvedor.CANCELADO,
+                                "ESTORNADO": StatusPagamentoProvedor.ESTORNADO,
+                            }
+                            st = status_map.get(pag.status, StatusPagamentoProvedor.PENDENTE)
+                            ordem = ResultadoOrdemProvedor(
+                                provider_order_id=pag.provider_order_id,
+                                external_reference=pag.id,
+                                status=st,
+                                total_centavos=pag.total_centavos,
+                                moeda="BRL",
+                                qr_data=pag.qr_data,
+                                raw_status="processed" if st == StatusPagamentoProvedor.CONFIRMADO else "opened",
+                            )
+                            self._orders[provider_order_id] = ordem
+                            return ordem
+            except Exception:
+                pass
+            if provider_order_id not in self._orders:
+                raise ErroOperacaoProvedorError(f"Order {provider_order_id} não encontrada")
         return self._orders[provider_order_id]
 
     def buscar_por_external_reference(
