@@ -14,12 +14,15 @@ spec:
       containers:
         - name: migrate
           image: us-east1-docker.pkg.dev/fiap-project-514922/oficina-docker/oficina-billing:latest
-          command: ["alembic", "upgrade", "head"]
+          command:
+            - sh
+            - -c
+            - |
+              export DATABASE_URL=$(cat /mnt/secrets-store/DATABASE_URL)
+              exec alembic upgrade head
           envFrom:
             - configMapRef:
                 name: oficina-billing-config
-            - secretRef:
-                name: oficina-billing-secret
           resources:
             requests:
               cpu: 100m
