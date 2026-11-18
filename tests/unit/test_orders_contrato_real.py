@@ -24,10 +24,22 @@ def test_busca_orders_inclui_datas_e_codifica_referencia():
     def handler(request):
         assert request.url.params["external_reference"] == "pagamento+teste"
         assert request.url.params["begin_date"] < request.url.params["end_date"]
-        return httpx.Response(200, json={"elements": []})
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "ORDTST1",
+                        "external_reference": "pagamento+teste",
+                        "total_amount": "1.00",
+                    },
+                ]
+            },
+        )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         provider = MercadoPagoOrdersClient(
             access_token="token-test", external_pos_id="POS", http_client=client
         )
-        assert provider.buscar_por_external_reference("pagamento+teste") is None
+        order = provider.buscar_por_external_reference("pagamento+teste")
+        assert order.provider_order_id == "ORDTST1"

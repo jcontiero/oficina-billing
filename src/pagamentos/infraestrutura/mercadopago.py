@@ -305,7 +305,7 @@ class MercadoPagoOrdersClient:
             }
         )
         data = self._request("GET", f"/v1/orders?{parametros}")
-        itens = data.get("elements") or data.get("results") or []
+        itens = data.get("data") or data.get("elements") or data.get("results") or []
         if not itens and "id" in data:
             itens = [data]
         for item in itens:
