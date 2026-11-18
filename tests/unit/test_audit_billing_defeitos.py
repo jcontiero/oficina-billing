@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -440,6 +441,7 @@ def test_intencao_financeira_duravel_sobrevive_a_queda_apos_efeito_externo(
         assert op.estado == "SUCESSO"
         assert op.idempotency_key == idem_original
         assert pag.id == pag_id_original
-        assert pag.provider_order_id == "ORD_TEST_000001"
+        expected_id = hashlib.sha256(pag.id.encode()).hexdigest()[:12].upper()
+        assert pag.provider_order_id == f"ORD_TEST_{expected_id}"
         assert out.tipo_evento == "CobrancaCriada.v1"
         assert provedor._seq == 1

@@ -414,7 +414,10 @@ class FakeMercadoPagoOrdersProvider:
             return self._idempotency_cache[idempotency_key]
 
         self._seq += 1
-        order_id = f"ORD_TEST_{self._seq:06d}"
+        # Derive the fake ID from the payment so recreating fake state cannot
+        # collide with provider IDs already persisted by Billing.
+        suffix = hashlib.sha256(pagamento_id.encode("utf-8")).hexdigest()[:12].upper()
+        order_id = f"ORD_TEST_{suffix}"
         qr_data = (
             f"00020101021243650016COM.MERCADOLIBRE020130636{order_id}"
             f"5204000053039865406{centavos_para_decimal_str(total_centavos)}"
