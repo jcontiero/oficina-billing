@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -204,11 +205,28 @@ def test_reconciliacao_timeout_criar_cobranca_sem_duplicar(tmp_path: Path) -> No
         assert op is not None
         assert op.estado == "SUCESSO"
         assert pag is not None
-        assert pag.provider_order_id == "ORD_TEST_000001"
+        expected_id = hashlib.sha256(pag.id.encode()).hexdigest()[:12].upper()
+        assert pag.provider_order_id == f"ORD_TEST_{expected_id}"
         assert out is not None
         assert out.tipo_evento == "CobrancaCriada.v1"
         # Não houve segunda criação de ordem no provedor
         assert provedor._seq == 1
+
+
+def test_fake_order_id_permanece_estavel_apos_perda_do_estado() -> None:
+    pagamento_id = str(uuid4())
+    kwargs = {
+        "pagamento_id": pagamento_id,
+        "total_centavos": 25000,
+        "moeda": "BRL",
+        "descricao": "OS de teste",
+        "idempotency_key": f"create-{pagamento_id}-1",
+    }
+
+    ordem_original = FakeMercadoPagoOrdersProvider().criar_cobranca(**kwargs)
+    ordem_recuperada = FakeMercadoPagoOrdersProvider().criar_cobranca(**kwargs)
+
+    assert ordem_recuperada.provider_order_id == ordem_original.provider_order_id
 
 
 def test_webhook_assinatura_recusa_e_falha_estorno_recuperavel(tmp_path: Path) -> None:
