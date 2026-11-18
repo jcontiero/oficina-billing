@@ -1,5 +1,7 @@
 # Oficina Billing Service (`oficina-billing`)
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=jcontiero_oficina-billing&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=jcontiero_oficina-billing)
+
 Microsserviço de Faturamento (Orçamentos versionados e Pagamentos via QR Dinâmico na Orders API do Mercado Pago) da Fase 4 do Tech Challenge.
 
 ## Responsabilidades
