@@ -2,10 +2,12 @@ import hashlib
 import hmac
 import json
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlencode
 
 import httpx
 
@@ -101,7 +103,7 @@ def mapear_status_order_mp(raw_status: str) -> StatusPagamentoProvedor:
 def gerar_assinatura_webhook_mp(
     *, data_id: str, x_request_id: str, ts: str, webhook_secret: str
 ) -> str:
-    manifesto = f"id:{data_id};request-id:{x_request_id};ts:{ts};"
+    manifesto = f"id:{data_id.lower()};request-id:{x_request_id};ts:{ts};"
     digest = hmac.new(
         webhook_secret.encode("utf-8"),
         manifesto.encode("utf-8"),
@@ -294,10 +296,16 @@ class MercadoPagoOrdersClient:
     def buscar_por_external_reference(
         self, external_reference: str
     ) -> ResultadoOrdemProvedor | None:
-        data = self._request(
-            "GET", f"/v1/orders?external_reference={external_reference}"
+        agora = datetime.now(UTC)
+        parametros = urlencode(
+            {
+                "external_reference": external_reference,
+                "begin_date": (agora - timedelta(days=7)).isoformat(),
+                "end_date": agora.isoformat(),
+            }
         )
-        itens = data.get("elements") or data.get("results") or []
+        data = self._request("GET", f"/v1/orders?{parametros}")
+        itens = data.get("data") or data.get("elements") or data.get("results") or []
         if not itens and "id" in data:
             itens = [data]
         for item in itens:

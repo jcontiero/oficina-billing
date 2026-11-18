@@ -384,13 +384,18 @@ def receber_webhook_mercadopago(
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     data_id = str((payload.get("data") or {}).get("id", ""))
+    signature_data_id = request.query_params.get("data.id", data_id)
+    if signature_data_id != data_id:
+        raise HTTPException(
+            status_code=401, detail="Identificador da assinatura divergente"
+        )
     action = str(payload.get("action", "order.updated"))
     webhook_secret = request.app.state.config.mp_webhook_secret
 
     if not validar_assinatura_webhook_mp(
         x_signature=x_signature,
         x_request_id=x_request_id,
-        data_id=data_id,
+        data_id=signature_data_id,
         webhook_secret=webhook_secret,
     ):
         raise HTTPException(status_code=401, detail="Assinatura x-signature inválida")
