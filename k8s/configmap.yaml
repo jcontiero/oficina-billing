@@ -11,6 +11,7 @@ data:
   CLIENT_JWKS_URL: "https://GATEWAY_HOST_PLACEHOLDER/.well-known/jwks.json"
   ADMIN_JWKS_URL: "http://oficina-api-service/.well-known/admin-jwks.json"
   MP_PROVIDER_MODE: "fake"
+  MP_EXTERNAL_POS_ID: "OFICINAF4POS01"
   MP_FAKE_SHARED_DATABASE: "true"
   DD_TRACE_ENABLED: "true"
   DD_VERSION: "latest"
